@@ -194,7 +194,7 @@ def _trim_redundant_returns(node):
     for funcdef in collector.result:
         statements = funcdef.statements.contents
 
-        if not statements:
+        if not statements or len(statements) == 1:
             continue
 
         # If there is an empty return block at the end of this
