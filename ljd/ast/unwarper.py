@@ -1667,12 +1667,6 @@ def _extract_if_expression(start, body, end, topmost_end):
 
     false, end_i = _search_expression_end(expression, falses)
 
-    if false is None:
-        unpacked_falses = sorted(falses,
-                                 key=lambda unpacked_false: unpacked_false.index)
-        false = unpacked_falses[-1]
-        end_i = len(expression)
-
     assert false is not None
     assert end_i >= 0
 
