@@ -1723,8 +1723,6 @@ def _find_branching_end(blocks, topmost_end, loop_start=None):
                     setattr(block, "_decompilation_error_here", True)
                     print("-- WARNING: Error occurred during decompilation.")
                     print("--   Code may be incomplete or incorrect.")
-                    if hasattr(end, "warp") and _get_target(end.warp) == block:
-                        return end
                 else:
                     raise
             return block
