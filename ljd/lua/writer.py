@@ -15,6 +15,8 @@ compact_table_constructors = False
 comment_empty_blocks = True
 show_slot_ids = False
 show_line_info = False
+use_function_definition_syntactic_sugar = False
+write_function_definition_self_arg = False
 
 CMD_START_STATEMENT = 0
 CMD_END_STATEMENT = 1
@@ -182,7 +184,7 @@ class Visitor(traverse.Visitor):
             self._write("function ")
 
             fn = self._state().function_name
-            if is_method:
+            if is_method and not write_function_definition_self_arg:
                 self._visit(fn.table)
                 self._write(":")
                 self._write(fn.key)
@@ -198,7 +200,7 @@ class Visitor(traverse.Visitor):
         args = node.arguments
 
         # If this is a method, remove the "self" argument
-        if is_method:
+        if is_method and not write_function_definition_self_arg:
             # AFAIK we don't ever use the args again, and if we
             #  use a new args object then the original one gets written later on
             orig = args.contents
@@ -254,7 +256,7 @@ class Visitor(traverse.Visitor):
     def visit_table_constructor(self, node):
         self._write("{")
 
-        # These are both delt with in the contents array, no need to visit them separately
+        # These are both dealt with in the contents array, no need to visit them separately
         self._skip(node.array)
         self._skip(node.records)
 
@@ -325,9 +327,12 @@ class Visitor(traverse.Visitor):
             src = srcs[0]
 
             src_is_function = isinstance(src, nodes.FunctionDefinition)
-            dst_is_simple = self._is_acceptable_func_dst(dst)
-
             if src_is_function:
+                if use_function_definition_syntactic_sugar:
+                    dst_is_simple = self._is_acceptable_func_dst(dst)
+                else:
+                    dst_is_simple = self._is_variable(dst)
+
                 if dst_is_simple:
                     self._state().function_name = dst
                     self._state().function_local = is_local
@@ -681,8 +686,6 @@ class Visitor(traverse.Visitor):
 
         if is_statement:
             self._start_statement(STATEMENT_FUNCTION_CALL)
-
-        func = node.function
 
         # We are going to modify this list so we can remove the first argument
         args = node.arguments.contents

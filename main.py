@@ -128,6 +128,13 @@ class Main:
         parser.add_option("--unsafe", type="string", dest="unsafe_extra_pass", default="true",
                           help="unsafe extra pass to try to correct some leftover values")
 
+        # Control over various parts of writer output
+        parser.add_option("--function_def_sugar", type="string", dest="function_def_sugar", default="true",
+                          help="write function defintions as \"function <name>()\" instead of \"<name> = function ()\""
+                               " (false implies function_def_self_arg = true)")
+        parser.add_option("--function_def_self_arg", type="string", dest="function_def_self_arg", default="false",
+                          help="include self in function definition arguments")
+
         group = OptionGroup(parser, "Debug Options")
 
         # Output a log of exceptions and information during decompilation
@@ -195,6 +202,12 @@ class Main:
 
         if self.options.include_line_numbers:
             ljd.lua.writer.show_line_info = True
+
+        if self.options.function_def_sugar.lower() in ['true', '1', 't', 'y', 'yes']:
+            ljd.lua.writer.use_function_definition_syntactic_sugar = True
+
+        if self.options.function_def_self_arg.lower() in ['true', '1', 't', 'y', 'yes']:
+            ljd.lua.writer.write_function_definition_self_arg = True
 
         self.options.unsafe_extra_pass = self.options.unsafe_extra_pass.lower() in ['true', '1', 't', 'y', 'yes']
 
