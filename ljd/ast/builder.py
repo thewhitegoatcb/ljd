@@ -1144,7 +1144,7 @@ def _fix_broken_repeat_until_loops(state, instructions):
                             checked_instruction_destination \
                                 = get_jump_destination(j, checked_instruction)
 
-                            # If the destination would've been moved
+                            # If the destination was moved
                             if checked_instruction.CD >= shift \
                                     and checked_instruction_destination == insertion_index + shift:
 
@@ -1253,7 +1253,7 @@ def _insert_instruction(state, instructions, index, new_instruction):
     # Offset
     shift = 1
 
-    # Update warp destinations with regards to the inserted instruction
+    # Update warp destinations with regard to the inserted instruction
     _shift_warp_destinations(state, instructions, shift, index)
 
     # Update variable info ranges

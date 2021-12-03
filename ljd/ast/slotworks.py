@@ -318,7 +318,7 @@ def _fill_simple_refs(info, data: RefsProcessData, ignore_ambiguous, safe_mode=T
                     assert tst_holder != ref.path[-2]
                     assert tst_holder != holder
 
-        # Could be more then one reference here
+        # Could be more than one reference here
         if src_is_table and is_element and is_dst and all_ctor_refs:
             assert holder.table == ref.identifier
             data.tables.append((info, ref))
@@ -376,7 +376,7 @@ def _eliminate_simple_cases(simple):
         # substitute a primitive to somewhere it's not allowed, such as:
         #    local a=nil; a()  ---> nil()
         # We're doing this here rather than in _fill_simple_refs, since that doesn't actually know what
-        # it's substituting - a primitive could work it's way down a bunch of slots and it'd only know about
+        # it's substituting - a primitive could work its way down a bunch of slots and it'd only know about
         # the primitive when eliminating the first slot.
         # See the illegal_type_eliminations test for an example of this
         if isinstance(src, nodes.Primitive) or isinstance(src, nodes.Constant):
