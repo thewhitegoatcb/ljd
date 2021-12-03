@@ -1008,7 +1008,13 @@ class Visitor(traverse.Visitor):
         assert node is not None
 
         if node in self._visited_nodes[-1]:
-            return
+            # This is necessary now because expression list nils share the same address, and are therefore ignored.
+            # Presumably because of
+            # https://gitlab.com/znixian/luajit-decompiler/-/commit/a26be731ee690020f03220ad4c003fadc42b408c
+            # TODO: Find some way to fix this at slotworks.py
+            if not (isinstance(node, nodes.Primitive) and
+                    node.type == nodes.Primitive.T_NIL and self.print_queue[-1][1] == ', '):
+                return
 
         self._visited_nodes[-1].add(node)
 
