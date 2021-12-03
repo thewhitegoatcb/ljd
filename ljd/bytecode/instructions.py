@@ -61,6 +61,9 @@ class _Instruction:
         if self.CD_type is not None:
             self.CD = 0
 
+    def __str__(self):
+        return self.name + ": " + self.description + " instruction at " + str(hex(id(self)))
+
 
 # Represents a bytecode instruction
 #
