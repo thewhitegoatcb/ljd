@@ -874,7 +874,7 @@ def _find_expressions(start, body, end, level=0, known_blocks=None):
                     ends_in_primitive = True
 
             if block == start and not has_contents:
-                return []
+                return [], expressions
             elif ending_assignment is not None:
                 if not ends_in_primitive:
                     sure_expression = False
