@@ -856,30 +856,9 @@ def _find_expressions(start, body, end, level=0, known_blocks=None):
                     i += 1
                     continue
 
-
         elif isinstance(block.warp, nodes.UnconditionalWarp):
-            is_end = block.warp.target == end
-            has_contents = len(block.contents) != 0
-
-            # (Aussiemon)
-            # Ending assignments indicate subexpression
-            # shouldn't be collapsed into a single line.
-            ending_assignment = None
-            ends_in_primitive = False
-            if (is_end and has_contents
-                    and isinstance(block.contents[-1], nodes.Assignment)):
-                ending_assignment = block.contents[-1]
-                if isinstance(ending_assignment.expressions.contents[-1],
-                              nodes.Primitive):
-                    ends_in_primitive = True
-
-            if block == start and not has_contents:
+            if block == start and len(block.contents) == 0:
                 return [], expressions
-            elif ending_assignment is not None:
-                if not ends_in_primitive:
-                    sure_expression = False
-                elif slot < 0:
-                    sure_expression = True
 
         if len(block.contents) == 0:
             continue
