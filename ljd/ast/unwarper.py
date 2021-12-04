@@ -223,12 +223,17 @@ def _unwarp_expressions(blocks):
             if warp.type == nodes.UnconditionalWarp.T_FLOW:
                 start_index += 1
                 continue
+            # (Aussiemon)
+            # In certain cases, expressions should not end prematurely
             elif start_index > 0 and len(start.contents) > 0:
-                # Don't continue in the 'false and false' / 'true or true' cases
-                if start_index != end_index \
-                        or not isinstance(start.contents[-1], nodes.Assignment) \
-                        or len(start.contents[-1].expressions.contents) == 0 \
-                        or not isinstance(start.contents[-1].expressions.contents[-1], nodes.Primitive):
+                if start_index != end_index:
+                    start_index += 1
+                    continue
+                elif not _contains_primitive_condition(start):
+                    # Don't continue if start ends in primitive condition (e.g. and false / or true)
+                    start_index += 1
+                    end_index += 1
+                    continue
 
                     # NOTE Don't skip the last statement (before the return), it may be an expression
                     if start_index == end_index:
@@ -772,10 +777,6 @@ def _find_expressions(start, body, end, level=0, known_blocks=None):
             # Loop? No way!
             assert new_i > current_i
 
-            # It should end with a conditional warp if that's
-            # really a subexpression-as-operand
-            end_warp = endest_end.warp
-
             # If any of the subexpressions are put into local variables, then this
             #  must be an if block, rather than an expression.
             for _, sub_start, sub_end, sub_slot, sub_slot_type, *_ in subs:
@@ -855,9 +856,30 @@ def _find_expressions(start, body, end, level=0, known_blocks=None):
                     i += 1
                     continue
 
+
         elif isinstance(block.warp, nodes.UnconditionalWarp):
-            if block == start and len(block.contents) == 0:
-                return [], expressions
+            is_end = block.warp.target == end
+            has_contents = len(block.contents) != 0
+
+            # (Aussiemon)
+            # Ending assignments indicate subexpression
+            # shouldn't be collapsed into a single line.
+            ending_assignment = None
+            ends_in_primitive = False
+            if (is_end and has_contents
+                    and isinstance(block.contents[-1], nodes.Assignment)):
+                ending_assignment = block.contents[-1]
+                if isinstance(ending_assignment.expressions.contents[-1],
+                              nodes.Primitive):
+                    ends_in_primitive = True
+
+            if block == start and not has_contents:
+                return []
+            elif ending_assignment is not None:
+                if not ends_in_primitive:
+                    sure_expression = False
+                elif slot < 0:
+                    sure_expression = True
 
         if len(block.contents) == 0:
             continue
@@ -1217,7 +1239,10 @@ def _unwarp_expression(body, end, true, false):
 
                 next_inv = _is_inverted(next_block.warp, true, end)
 
-                this_inv = _is_inverted(warp, true, end)
+                if _contains_primitive_condition(block):
+                    this_inv = not _is_inverted(warp, true, end)
+                else:
+                    this_inv = _is_inverted(warp, true, end)
 
                 # Special hack for unary expressions (x, not x)...
                 if next_inv != this_inv:
@@ -1233,13 +1258,15 @@ def _unwarp_expression(body, end, true, false):
 
         next_block = body[last_block_index + 1]
 
-        operator = _get_operator(last_block, true, end)
+        operator = _get_operator(subexpression, len(subexpression) - 1, true, end)
 
         new_subexpression = _compile_subexpression(subexpression, operator,
                                                last_block, next_block,
                                                true, end)
 
-        if new_subexpression:
+        # (Aussiemon)
+        # Don't continue subexpression at NoOp
+        if new_subexpression and not isinstance(new_subexpression, nodes.NoOp):
             parts.append(new_subexpression)
             parts.append(operator)
 
@@ -1307,25 +1334,40 @@ def _set_target(warp, target):
         warp.target = target
 
 
-def _get_operator(block, true, end):
+def _get_operator(blocks, index, true, end):
+    block = blocks[index]
+
     if isinstance(block.warp, nodes.UnconditionalWarp):
         src = _get_last_assignment_source(block)
 
-        if isinstance(src, nodes.Constant):
-            is_true = True
-        elif isinstance(src, nodes.BinaryOperator):
-            is_true = True
-        elif isinstance(src, nodes.Primitive):
-            is_true = src.type == nodes.Primitive.T_TRUE
-        elif isinstance(src, nodes.Identifier):
-            is_true = True
-        # walterr: apparently unnecessary?
-        # elif isinstance(src, nodes.NoOp):
-        #     is_true = block.warp.target == end
+        if src is not None:
+            is_true = _is_unconditional_operator_true(block, src)
+        # Search for operator among blocks
         else:
-            # assert src is None
+            new_operator_src = None
+            new_operator_index = index - 1
 
-            is_true = block.warp.target == true
+            # (Aussiemon)
+            # Follow primitive chain to find actual operator.
+            # Used in var = true or true / true or false cases.
+            while new_operator_index >= 0:
+                preceding_block = blocks[new_operator_index]
+                if not isinstance(preceding_block.warp, nodes.UnconditionalWarp):
+                    break
+
+                preceding_src = _get_last_assignment_source(preceding_block)
+                if (isinstance(preceding_src, nodes.Primitive)
+                        or isinstance(preceding_src, nodes.BinaryOperator)):
+                    new_operator_src = preceding_src
+                else:
+                    break
+
+                new_operator_index -= 1
+
+            if new_operator_src is not None:
+                is_true = _is_unconditional_operator_true(block, new_operator_src)
+            else:
+                is_true = block.warp.target == true
 
         if is_true:
             return binop.T_LOGICAL_OR
@@ -1338,6 +1380,81 @@ def _get_operator(block, true, end):
             return binop.T_LOGICAL_OR
         else:
             return binop.T_LOGICAL_AND
+
+
+def _is_unconditional_operator_true(block, src):
+    is_true = None
+
+    # TODO: Validate these cases
+    if isinstance(src, nodes.Constant):
+        is_true = True
+    elif isinstance(src, nodes.UnaryOperator):
+        is_true = True
+    elif isinstance(src, nodes.BinaryOperator):
+        # (Aussiemon)
+        # Handle primitive to primitive cases
+        is_true = True
+
+        left_src = src.left
+        right_src = src.right
+
+        # Explore left binary tree
+        if isinstance(left_src, nodes.BinaryOperator):
+            left_src_true = _is_unconditional_operator_true(block, left_src)
+            left_src = nodes.Primitive()
+            left_src.type = (nodes.Primitive.T_TRUE
+                             if left_src_true else nodes.Primitive.T_FALSE)
+
+        # Explore right binary tree
+        if isinstance(right_src, nodes.BinaryOperator):
+            right_src_true = _is_unconditional_operator_true(block, right_src)
+            right_src = nodes.Primitive()
+            right_src.type = (nodes.Primitive.T_TRUE
+                              if right_src_true else nodes.Primitive.T_FALSE)
+
+        # Determine operator
+        if (isinstance(left_src, nodes.Primitive)
+                and isinstance(right_src, nodes.Primitive)
+                and src.type in (src.T_LOGICAL_OR, src.T_LOGICAL_AND)):
+            if left_src.type == nodes.Primitive.T_FALSE:
+                # false and false
+                if right_src.type == nodes.Primitive.T_FALSE:
+                    is_true = False
+                # false and/or true
+                else:
+                    is_true = src.type == src.T_LOGICAL_OR
+            elif right_src.type == nodes.Primitive.T_FALSE:
+                # true and/or false
+                is_true = src.type == src.T_LOGICAL_OR
+    elif isinstance(src, nodes.Primitive):
+        is_true = src.type == nodes.Primitive.T_TRUE
+    elif isinstance(src, nodes.Identifier):
+        is_true = True
+    elif isinstance(src, nodes.TableElement):
+        is_true = True
+    elif isinstance(src, nodes.FunctionCall):
+        is_true = True
+    elif isinstance(src, nodes.FunctionDefinition):
+        is_true = True
+    elif isinstance(src, nodes.NoOp):
+        is_true = True
+    # (Aussiemon)
+    # An unknown src type indicates a new
+    # case that needs to be accounted for.
+    else:
+        try:
+            assert src is None
+        except AssertionError:
+            if catch_asserts:
+                setattr(block, "_decompilation_error_here", True)
+                print("-- WARNING: _get_operator src is not None")
+                print("--   Code may be incomplete or incorrect.")
+
+                is_true = True
+            else:
+                raise
+
+    return is_true
 
 
 def _get_last_assignment_source(block):
@@ -2185,6 +2302,35 @@ def _is_flow(warp):
 def _is_jump(warp):
     return isinstance(warp, nodes.UnconditionalWarp) \
            and warp.type == nodes.UnconditionalWarp.T_JUMP
+
+
+def _contains_primitive_condition(block):
+    if len(block.contents) == 0:
+        return False
+
+    last_index = len(block.contents) - 1
+    for i in range(0, last_index):
+        block_content = block.contents[last_index - i]
+
+        if isinstance(block_content, nodes.Assignment):
+
+            # Check for an assignment within the block
+            assignment = block_content
+            if (len(assignment.destinations.contents) > 0
+                    and len(assignment.expressions.contents) > 0):
+                destination = assignment.destinations.contents[-1]
+                expression = assignment.expressions.contents[-1]
+
+                if isinstance(expression, nodes.Primitive):
+                    if hasattr(destination, "name") and destination.name is None:
+                        # There is a primitive condition within the block's expression
+                        # e.g. b = false and (x or y)
+                        return True
+                    else:
+                        # Check if primitive condition is preceeded by normal primitive assignment
+                        # e.g. a = nil -> b = (false and x) or y
+                        return not isinstance(block.warp, nodes.ConditionalWarp)
+    return False
 
 
 def _fix_nested_ifs(blocks, start):
