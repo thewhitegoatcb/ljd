@@ -103,7 +103,7 @@ def lj_compile(config, input, output, symbols):
 
 def lj_decompile(config, input, output):
     main_file = Path(sys.argv[0]).resolve().parent / "main.py"
-    args = ["python3", str(main_file), "-f", str(input), "-o", str(output)]
+    args = [config.python, str(main_file), "-f", str(input), "-o", str(output)]
     cfg_run(config, args)
 
 

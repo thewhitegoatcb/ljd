@@ -16,11 +16,15 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Print per-test information")
     parser.add_argument("--wait", action="store_true", help="Once the tests are complete, wait for user input before "
                                                             "deleting the artifacts")
+    parser.add_argument("--python",
+                      type=str, default="python3",
+                      help="Name of Python executable")
 
     args = parser.parse_args()
 
     config = Config()
     config.verbose = args.verbose
+    config.python = args.python
 
     by_name = dict()
     for test in all_tests:
