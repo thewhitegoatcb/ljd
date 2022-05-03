@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 #
 # The MIT License (MIT)
 #
@@ -116,6 +116,11 @@ class Main:
                           action="store_true", dest="enable_logging", default=False,
                           help="log info and exceptions to external file while decompiling")
 
+        # Output pseudo-asm to a file during decompilation
+        parser.add_option("-A", "--pseudo-asm",
+                          type="string", dest="pseudoasm", default="",
+                          help="output pseudoasm file name", metavar="FILE")
+
         (self.options, args) = parser.parse_args()
 
         # Initialize opcode set for required LuaJIT version
@@ -227,7 +232,9 @@ class Main:
         if not prototype:
             return 1
 
-        # self.ljd.pseudoasm.writer.write(sys.stdout, header, prototype)
+        if self.options.pseudoasm:
+            with open(self.options.pseudoasm, "w", encoding="utf8") as out_file:
+                self.ljd.pseudoasm.writer.write(out_file, header, prototype)
 
         self.ast = self.ljd.ast.builder.build(prototype)
 
