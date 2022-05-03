@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 #
 # The MIT License (MIT)
 #
@@ -149,7 +149,9 @@ class Main:
                          help="do not run the unwarper")
 
         # Output the pseudoasm of the initial AST instead of decompiling the input
-        group.add_option("--asm", action="store_true", dest="output_pseudoasm", default=False, help="Print pseudo asm")
+        group.add_option("--asm", action="store_true", dest="print_pseudoasm", default=False, help="Print pseudo asm")
+        group.add_option("--output-asm", type="string", dest="output_pseudoasm", default="",
+                         help="Output pseudo asm to file name", metavar="FILE")
 
         group.add_option("--dump", action="store_true", dest="dump_ast", default=False, help="Dump AST")
 
@@ -303,7 +305,7 @@ class Main:
 
         generate_linemap = bool(self.options.line_map_output_file)
 
-        if not self.options.output_pseudoasm:
+        if not self.options.print_pseudoasm:
             if self.options.output:
                 output_file = self.options.output
                 if os.path.isdir(output_file):
@@ -372,8 +374,12 @@ class Main:
         if not prototype:
             return 1
 
-        if self.options.output_pseudoasm:
+        if self.options.print_pseudoasm:
             ljd.pseudoasm.writer.write(sys.stdout, header, prototype)
+
+        if self.options.output_pseudoasm:
+            with open(self.options.output_pseudoasm, "w", encoding="utf8") as out_file:
+                ljd.pseudoasm.writer.write(out_file, header, prototype)
 
         ast = ljd.ast.builder.build(header, prototype)
 
