@@ -360,6 +360,8 @@ class Main:
                 bc_version = 2.0
             elif preheader.version == 2:
                 bc_version = 2.1
+            elif preheader.version == 130:
+                bc_version = 2.1
             else:
                 raise Exception("Unsupported bytecode version: " + str(bc_version))
 
