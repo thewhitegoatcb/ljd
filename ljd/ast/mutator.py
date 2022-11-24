@@ -7,6 +7,8 @@ import copy
 from ljd.ast.helpers import *
 from ljd.bytecode.instructions import SLOT_FALSE, SLOT_TRUE
 
+catch_asserts = False
+
 
 class SimpleLoopWarpSwapper(traverse.Visitor):
     class _State:
@@ -92,7 +94,16 @@ class SimpleLoopWarpSwapper(traverse.Visitor):
                 continue
 
             next_index = block.index - index_shift + 1
-            assert block.warp.false_target.index == next_index
+            try:
+                assert block.warp.false_target.index == next_index
+            except AssertionError:
+                if catch_asserts:
+                    setattr(block, "_decompilation_error_here", True)
+                    print("-- WARNING: Error occurred during decompilation.")
+                    print("--   Code may be incomplete or incorrect.")
+                    continue
+                else:
+                    raise
 
             new_block = self._create_dummy_block(block, slot)
 

@@ -192,7 +192,7 @@ class Main:
         if self.options.catch_asserts:
             ljd.ast.builder.handle_invalid_functions = True
 
-        for mod in [ljd.ast.unwarper, ljd.ast.slotworks, ljd.ast.validator]:
+        for mod in [ljd.ast.unwarper, ljd.ast.slotworks, ljd.ast.validator, ljd.ast.mutator]:
             if self.options.dump_ast:
                 mod.debug_dump = True
             if self.options.catch_asserts:
