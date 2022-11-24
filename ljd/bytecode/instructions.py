@@ -42,8 +42,8 @@ T_FUN = 11  # function prototype, negated index into constant table
 T_CDT = 12  # cdata constant, negated index into constant table
 T_JMP = 13  # branch target, relative to next instruction, biased with 0x8000
 
-SLOT_FALSE = 30000  # placeholder slot value for logical false
-SLOT_TRUE = 30001  # placeholder slot value for logical true
+SLOT_FALSE = 2000000000  # placeholder slot value for logical false
+SLOT_TRUE = 2000000001  # placeholder slot value for logical true
 
 
 class _Instruction:
