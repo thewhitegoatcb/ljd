@@ -10,6 +10,7 @@ from ljd.bytecode.helpers import get_jump_destination
 
 handle_invalid_functions = False
 
+
 class _State:
     def __init__(self):
         self.constants = None
@@ -243,7 +244,7 @@ def _establish_warps(state, instructions):
                         exit_instruction_found = True
                         break
 
-            # If we find the exit jump and we're not skipping it (if true then break else),
+            # If we find the exit jump, and we're not skipping it (if true then break else),
             #  form the original two jumps into a fake conditional warp.
             if exit_instruction_found \
                     and end_instruction_destination <= following_destination:
@@ -1283,7 +1284,7 @@ def _remove_instruction(state, instructions, index):
     # Offset
     shift = -1
 
-    # Update warp destinations with regards to the removed instruction
+    # Update warp destinations with regard to the removed instruction
     _shift_warp_destinations(state, instructions, shift, index)
 
     # Update variable info ranges
