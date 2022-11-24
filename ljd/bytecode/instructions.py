@@ -4,8 +4,8 @@
 
 #
 # Almost direct wiki-to-code from
-# http://wiki.luajit.org/Bytecode-2.0
-#
+# https://web.archive.org/web/20220607041223/http://wiki.luajit.org/Bytecode-2.0
+# Formerly: http://wiki.luajit.org/Bytecode-2.0
 
 
 # What the hell is an upvalue?
