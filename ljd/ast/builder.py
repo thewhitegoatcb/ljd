@@ -206,12 +206,28 @@ def _establish_warps(state, instructions):
         start_addr = max(block.last_address - 1, block.first_address)
 
         # Catch certain double unconditional jumps caused by logical primitives in expressions:
-        if start_addr == (end_addr - 1) \
-                and end_addr + 1 < len(instructions) \
-                and instructions[start_addr].opcode == ins.JMP.opcode \
-                and instructions[end_addr].opcode == ins.JMP.opcode \
-                and instructions[start_addr].A == instructions[end_addr].A \
-                and instructions[start_addr].CD == 0:
+        # TODO: This fix has bad conditions. It fixes:
+        #     if x or false then
+        # 	    print("if or false")
+        #     end
+        #  and:
+        #     if var1 ~= "foo" and false then
+        #     end
+        #     if var2 ~= "bar" then
+        # 	    var1 = var2
+        #     end
+        #  but not:
+        #     if var1 ~= "foo" and false then
+        #     end
+        #     if var2("bar") then
+        # 	    var1 = var2
+        #     end
+        if False and (start_addr == (end_addr - 1)
+                      and end_addr + 1 < len(instructions)
+                      and instructions[start_addr].opcode == ins.JMP.opcode
+                      and instructions[end_addr].opcode == ins.JMP.opcode
+                      and instructions[start_addr].A == instructions[end_addr].A
+                      and instructions[start_addr].CD == 0):
 
             end_instruction_destination = end_addr + instructions[end_addr].CD + 1
             target_instruction_A = instructions[start_addr].A
