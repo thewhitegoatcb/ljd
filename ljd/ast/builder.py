@@ -1281,7 +1281,11 @@ def _shift_warp_destinations(state, instructions, shift, modified_index):
         opcode = moved_instruction.opcode
 
         if opcode in _WARP_INSTRUCTIONS:
-            if current_index < modified_index and moved_instruction.CD >= 0:
+            # A non-branching UCLO should jump to the next instruction
+            if opcode == ins.UCLO.opcode and moved_instruction.CD == 0:
+                continue
+
+            elif current_index < modified_index and moved_instruction.CD >= 0:
                 destination = get_jump_destination(current_index, moved_instruction)
                 if destination > modified_index or (destination == modified_index and shift > 0):
                     moved_instruction.CD += shift
