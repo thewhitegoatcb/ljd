@@ -4,8 +4,8 @@
 
 #
 # Almost direct wiki-to-code from
-# http://wiki.luajit.org/Bytecode-2.0
-#
+# https://web.archive.org/web/20220607041223/http://wiki.luajit.org/Bytecode-2.0
+# Formerly: http://wiki.luajit.org/Bytecode-2.0
 
 
 # What the hell is an upvalue?
@@ -19,8 +19,6 @@
 # 	bla-bla
 # 	bar(...)
 #
-
-import ljd.config.version_config
 
 # Argument types
 
@@ -44,8 +42,8 @@ T_FUN = 11  # function prototype, negated index into constant table
 T_CDT = 12  # cdata constant, negated index into constant table
 T_JMP = 13  # branch target, relative to next instruction, biased with 0x8000
 
-SLOT_FALSE = 30000  # placeholder slot value for logical false
-SLOT_TRUE = 30001  # placeholder slot value for logical true
+SLOT_FALSE = 2000000000  # placeholder slot value for logical false
+SLOT_TRUE = 2000000001  # placeholder slot value for logical true
 
 
 class _Instruction:
@@ -53,6 +51,7 @@ class _Instruction:
         for key, value in definition.__dict__.items():
             setattr(self, key, value)
 
+        self.Bytecode = 0
         if self.A_type is not None:
             self.A = 0
 
@@ -62,13 +61,24 @@ class _Instruction:
         if self.CD_type is not None:
             self.CD = 0
 
+    def __str__(self):
+        return self.name + ": " + self.description + " instruction at " + str(hex(id(self)))
 
+
+# Represents a bytecode instruction
+#
+# Note about opcodes:
+# These were previously set from the order the objects were created
+# in. They are now set by ljd.rawdump.code.init, from the luajit_opcode
+# files. (this means the opcodes were duplicated, as they were stored both
+# explicitly in the luajit_opcode files and implicitly in the order of
+# the instruction objects)
+#
+# See ljd.ast.builder.init for a description of why this change was made.
 class _IDef:
-    _LAST_OPCODE = 0
-
     def __init__(self, name, A_type, B_type, CD_type, description):
         self.name = name
-        self.opcode = _IDef._LAST_OPCODE
+        self.opcode = None  # This gets assigned by ljd.rawdump.code.init
         self.A_type = A_type
         self.B_type = B_type
         self.CD_type = CD_type
@@ -77,8 +87,6 @@ class _IDef:
         self.args_count = (self.A_type is not None) \
             + (self.B_type is not None) \
             + (self.CD_type is not None)
-
-        _IDef._LAST_OPCODE += 1
 
     def __call__(self):
         return _Instruction(self)
@@ -114,9 +122,9 @@ ISFC = _IDef("ISFC", T_DST, None, T_VAR, "{A} = {D}; if not {D}")
 IST = _IDef("IST", None, None, T_VAR, "if {D}")
 ISF = _IDef("ISF", None, None, T_VAR, "if not {D}")
 
-if ljd.config.version_config.use_version > 2.0:
-    ISTYPE = _IDef("ISTYPE", T_VAR, None, T_LIT, "see lj vm source")
-    ISNUM = _IDef("ISNUM", T_VAR, None, T_LIT, "see lj vm source")
+# Added in bytecode version 2
+ISTYPE = _IDef("ISTYPE", T_VAR, None, T_LIT, "see lj vm source")
+ISNUM = _IDef("ISNUM", T_VAR, None, T_LIT, "see lj vm source")
 
 # Unary ops
 
@@ -188,8 +196,8 @@ TGETV = _IDef("TGETV", T_DST, T_VAR, T_VAR, "{A} = {B}[{C}]")
 TGETS = _IDef("TGETS", T_DST, T_VAR, T_STR, "{A} = {B}.{C}")
 TGETB = _IDef("TGETB", T_DST, T_VAR, T_LIT, "{A} = {B}[{C}]")
 
-if ljd.config.version_config.use_version > 2.0:
-    TGETR = _IDef("TGETR", T_DST, T_VAR, T_VAR, "{A} = {B}[{C}]")
+# Added in bytecode version 2
+TGETR = _IDef("TGETR", T_DST, T_VAR, T_VAR, "{A} = {B}[{C}]")
 
 TSETV = _IDef("TSETV", T_VAR, T_VAR, T_VAR, "{B}[{C}] = {A}")
 TSETS = _IDef("TSETS", T_VAR, T_VAR, T_STR, "{B}.{C} = {A}")
@@ -199,8 +207,8 @@ TSETM = _IDef("TSETM", T_BS, None, T_NUM,
               "for i = 0, MULTRES, 1 do"
               " {A_minus_one}[{D_low} + i] = slot({A} + i)")
 
-if ljd.config.version_config.use_version > 2.0:
-    TSETR = _IDef("TSETR", T_VAR, T_VAR, T_VAR, "{B}[{C}] = {A}")
+# Added in bytecode version 2
+TSETR = _IDef("TSETR", T_VAR, T_VAR, T_VAR, "{B}[{C}] = {A}")
 
 # Calls and vararg handling. T = tail call.
 

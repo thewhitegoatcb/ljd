@@ -4,10 +4,19 @@
 
 import re
 import sys
+import traceback
 
 import ljd.ast.nodes as nodes
 import ljd.ast.traverse as traverse
+import ljd
 from ljd.bytecode.instructions import SLOT_FALSE, SLOT_TRUE
+
+compact_table_constructors = False
+comment_empty_blocks = True
+show_slot_ids = False
+show_line_info = False
+use_function_definition_syntactic_sugar = False
+write_function_definition_self_arg = False
 
 CMD_START_STATEMENT = 0
 CMD_END_STATEMENT = 1
@@ -34,7 +43,36 @@ STATEMENT_WHILE = 8
 
 STATEMENT_FUNCTION = 9
 
-VALID_IDENTIFIER = re.compile(r'^\w[\w\d]*$')
+VALID_IDENTIFIER = re.compile(r'^[a-zA-Z_][\w]*$')
+
+RESERVED_WORDS = [
+    "and",
+    "break",
+    "do",
+    "else",
+    "elseif",
+    "end",
+    "false",
+    "for",
+    "function",
+    "if",
+    "in",
+    "local",
+    "nil",
+    "not",
+    "or",
+    "repeat",
+    "return",
+    "then",
+    "true",
+    "until",
+    "while"
+]
+
+LIST_TYPES = (nodes.VariablesList,
+              nodes.IdentifiersList,
+              nodes.ExpressionsList,
+              nodes.StatementsList)
 
 
 class _State:
@@ -42,6 +80,7 @@ class _State:
         self.current_statement = STATEMENT_NONE
         self.function_name = None
         self.function_local = False
+        self.function_method = False
 
 
 class Visitor(traverse.Visitor):
@@ -50,8 +89,11 @@ class Visitor(traverse.Visitor):
 
         self.print_queue = []
 
+        self._path = []
         self._visited_nodes = [set()]
         self._states = [_State()]
+
+        self.line_token_map = {}
 
     # ##
 
@@ -88,18 +130,66 @@ class Visitor(traverse.Visitor):
 
     # ##
 
+    def _write_slot(self, node):
+        slot = None
+        slot_ids = None
+
+        if isinstance(node, nodes.Identifier):
+            slot = node.slot
+
+            if node.id != -1:
+                slot_ids = node.id
+            else:
+                slot_ids = getattr(node, "_ids", None)
+        else:
+            slot = getattr(node, "_slot", None)
+            slot_id = getattr(node, "_slot_id", None)
+
+        assert slot is not None
+
+        name = "slot" + str(slot)
+
+        if show_slot_ids:
+            if slot_ids and slot_ids != -1:
+                name += "#"
+                if isinstance(slot_ids, list):
+                    name += "{"
+                    for i, slot_id in enumerate(slot_ids):
+                        if i > 0:
+                            name += "|"
+                        name += str(slot_id)
+                    name += "}"
+                else:
+                    name += str(slot_ids)
+
+        self._write(name)
+
+    # ##
+
     def visit_function_definition(self, node):
         is_statement = self._state().function_name is not None
+        is_method = self._state().function_method
 
         if is_statement:
             self._start_statement(STATEMENT_FUNCTION)
+
+            lineinfo = show_line_info and getattr(node, "_lineinfo", None)
+            if lineinfo:
+                self._write("-- Lines {0}-{1}".format(lineinfo[0], lineinfo[0] + lineinfo[1]))
+                self._end_line()
 
             if self._state().function_local:
                 self._write("local ")
 
             self._write("function ")
 
-            self._visit(self._state().function_name)
+            fn = self._state().function_name
+            if is_method and not write_function_definition_self_arg:
+                self._visit(fn.table)
+                self._write(":")
+                self._write(fn.key)
+            else:
+                self._visit(fn)
 
             self._write("(")
 
@@ -107,11 +197,46 @@ class Visitor(traverse.Visitor):
         else:
             self._write("function (")
 
-        self._visit(node.arguments)
+        args = node.arguments
+
+        # If this is a method, remove the "self" argument
+        if is_method and not write_function_definition_self_arg:
+            # AFAIK we don't ever use the args again, and if we
+            #  use a new args object then the original one gets written later on
+            orig = args.contents
+            args.contents = orig[1:]
+
+            assert orig[0].name == "self"
+
+            # Same as above with function_name, set this to false afterwards
+            # This is because it is only set in visit_assignment if it is a
+            # simple assignment. If we have two functions one after the other,
+            # and the first is a method while the other is not but uses
+            # a complex assignment, then this variable will not be reset and
+            # the above assertion will fail, as the writer thinks it is a method.
+            # See https://gitlab.com/znixian/luajit-decompiler/issues/13
+            self._state().function_method = False
+
+        self._visit(args)
 
         self._write(")")
 
         self._end_line()
+
+        # If there were unrecoverable errors in the function (namely invalid bytecodes), an error will
+        # be set for the entire function. Print it out as a comment, along with an error to crash the
+        # program should the generated source be recompiled.
+        if node.error:
+            self._start_block()
+            self._write('error("Decompilation failed")')
+            self._end_line()
+            self._write("-- Exception in function building!")
+            self._end_line()
+            for entry in traceback.format_exception(value=node.error, tb=node.error.__traceback__, etype=None):
+                for line in entry.strip().split("\n"):
+                    self._write("-- " + line)
+                    self._end_line()
+            self._end_block()
 
         # Syntactic Sugar: Cull empty returns at the ends of functions
         if len(node.statements.contents) > 1:
@@ -131,41 +256,39 @@ class Visitor(traverse.Visitor):
     def visit_table_constructor(self, node):
         self._write("{")
 
-        if len(node.records.contents) + len(node.array.contents) > 0:
+        # These are both dealt with in the contents array, no need to visit them separately
+        self._skip(node.array)
+        self._skip(node.records)
+
+        contents = node.array.contents + node.records.contents
+
+        if len(node.array.contents) > 0:
+            # Since we're using array+records in that order, the first
+            #  array item is also the first combined item.
+            first = contents.pop(0).value
+
+            if not isinstance(first, nodes.Primitive) or first.type != first.T_NIL:
+                record = nodes.TableRecord()
+                record.key = nodes.Constant()
+                record.key.type = nodes.Constant.T_INTEGER
+                record.key.value = 0
+                record.value = first
+
+                contents.insert(0, record)
+
+        if compact_table_constructors and len(contents) == 1:
+            self._visit(contents[0])
+        elif len(contents) > 0:
             self._end_line()
 
             self._start_block()
 
-            array = node.array.contents
-            records = node.records.contents
-
             all_records = nodes.RecordsList()
-            all_records.contents = array + records
-
-            if len(array) > 0:
-                first = array[0].value
-
-                all_records.contents.pop(0)
-
-                if not isinstance(first, nodes.Primitive) \
-                        or first.type != first.T_NIL:
-                    record = nodes.TableRecord()
-                    record.key = nodes.Constant()
-                    record.key.type = nodes.Constant.T_INTEGER
-                    record.key.value = 0
-                    record.value = first
-
-                    all_records.contents.insert(0, record)
+            all_records.contents = contents
 
             self._visit(all_records)
 
-            self._skip(node.array)
-            self._skip(node.records)
-
             self._end_block()
-        else:
-            self._skip(node.array)
-            self._skip(node.records)
 
         self._write("}")
 
@@ -204,12 +327,16 @@ class Visitor(traverse.Visitor):
             src = srcs[0]
 
             src_is_function = isinstance(src, nodes.FunctionDefinition)
-            dst_is_simple = self._is_variable(dst)
-
             if src_is_function:
+                if use_function_definition_syntactic_sugar:
+                    dst_is_simple = self._is_acceptable_func_dst(dst)
+                else:
+                    dst_is_simple = self._is_variable(dst)
+
                 if dst_is_simple:
                     self._state().function_name = dst
                     self._state().function_local = is_local
+                    self._state().function_method = self._is_method(dst, src)
 
                     self._visit(src)
 
@@ -249,6 +376,57 @@ class Visitor(traverse.Visitor):
 
         return False
 
+    def _is_acceptable_func_dst(self, dst):
+        # If this is an identifier, we're fine
+        if isinstance(dst, nodes.Identifier):
+            return True
+
+        # Otherwise, it must be a table element
+        if not isinstance(dst, nodes.TableElement):
+            return False
+
+        # It's key must be a constant
+        if not isinstance(dst.key, nodes.Constant):
+            return False
+
+        # Ensure the key is a string
+        if dst.key.type != nodes.Constant.T_STRING:
+            return False
+
+        # Ensure the key is alphanumeric, and the first character is a letter
+        key = dst.key.value
+        if key[0].isdigit():
+            # TODO I don't think the code in this generator checks this - so you can end up with a.1234.b
+            return False
+
+        for char in key:
+            if not char.isalnum() and char != "_":
+                return False
+
+        # Finally, recurse up the chain
+        return self._is_acceptable_func_dst(dst.table)
+
+    def _is_method(self, dst, func):
+        if not func.arguments.contents:
+            return False
+
+        selfarg = func.arguments.contents[0]
+
+        # This chokes on functions with their first argument being the vararg symbol
+        #  otherwise, since they don't have a `name` property
+        #  ex. `function myfunc(...)`
+        if not isinstance(selfarg, nodes.Identifier):
+            return False
+
+        if selfarg.name != "self":
+            return False
+
+        # Ensure the destination is on a table
+        if not isinstance(dst, nodes.TableElement):
+            return False
+
+        return True
+
     @staticmethod
     def _is_builtin(node):
         if not isinstance(node, nodes.Identifier):
@@ -261,7 +439,10 @@ class Visitor(traverse.Visitor):
         if not isinstance(key, nodes.Constant) or key.type != key.T_STRING:
             return False
 
-        return VALID_IDENTIFIER.match(key.value)
+        if not VALID_IDENTIFIER.match(key.value):
+            return False
+
+        return key.value not in RESERVED_WORDS
 
     # ##
 
@@ -277,32 +458,31 @@ class Visitor(traverse.Visitor):
 
         binop = nodes.BinaryOperator
 
+        # Rules for braces:
+        #  * A group MUST be braced if it is of a lower precedence (eg, if a * has a +, then the + must be braced)
+        #  * Braces are unnecessary if the group has a higher precedence
+        #  * If a group is of the same precedence, it must be braced if it is not on the associative side - so
+        #     `(a * b) / (c * d)` comes out to `a * b / (c * d)`
+
         if is_left_op:
-            if node.type <= binop.T_LOGICAL_AND:
-                left_parentheses = (
-                                           node.left.type <= node.type
-                                           or (node.left.type <= binop.T_LOGICAL_AND
-                                               and node.type <= binop.T_LOGICAL_AND)
-                                   ) and node.left.type != node.type
+            if node.is_right_associative():
+                left_parentheses = node.left.precedence() <= node.precedence()
             else:
-                left_parentheses = (
-                        node.left.type < node.type
-                        or (node.left.type == node.type == node.T_POW)
-                )
+                left_parentheses = node.left.precedence() < node.precedence()
 
         if is_right_op:
-            if node.type <= nodes.BinaryOperator.T_LOGICAL_AND:
-                right_parentheses = (
-                                            node.right.type <= node.type
-                                            or (node.right.type <= binop.T_LOGICAL_AND
-                                                and node.type <= binop.T_LOGICAL_AND)
-                                    ) and node.right.type != node.type
+            if node.is_right_associative():
+                right_parentheses = node.right.precedence() < node.precedence()
             else:
-                right_parentheses = (
-                        node.right.type < node.type
-                        or (node.right.type == node.type
-                            and node.type in (node.T_DIVISION, node.T_SUBTRACT))
-                )
+                right_parentheses = node.right.precedence() <= node.precedence()
+
+                # If this is either `a + (b + c)`, `a + (b - c)`, `a * (b * c)`, or `a * (b / c)`, we
+                #  can drop the braces:
+                if node.type == binop.T_ADD and binop.T_ADD <= node.right.type <= binop.T_SUBTRACT:
+                    right_parentheses = False
+
+                elif node.type == binop.T_MULTIPLY and binop.T_MULTIPLY <= node.right.type <= binop.T_DIVISION:
+                    right_parentheses = False
 
         if left_parentheses:
             self._write("(")
@@ -359,8 +539,6 @@ class Visitor(traverse.Visitor):
             self._write(")")
 
     def visit_unary_operator(self, node):
-        import ljd.config.version_config
-
         if node.type == nodes.UnaryOperator.T_LENGTH_OPERATOR:
             self._write("#")
         elif node.type == nodes.UnaryOperator.T_MINUS:
@@ -373,7 +551,7 @@ class Visitor(traverse.Visitor):
                     node.operand.slot = SLOT_TRUE
             else:
                 self._write("not ")
-        elif ljd.config.version_config.use_version > 2.0:
+        elif ljd.CURRENT_VERSION > 2.0:
             # TODO
             if node.type == nodes.UnaryOperator.T_TOSTRING:
                 self._write("tostring")
@@ -398,6 +576,17 @@ class Visitor(traverse.Visitor):
             self._start_block()
 
         self._push_state()
+
+        if comment_empty_blocks and len(self._path) > 1:
+            add_comment = False
+            if len(node.contents) == 0:
+                add_comment = isinstance(self._path[-2], (nodes.IteratorFor, nodes.If, nodes.ElseIf))
+            elif len(node.contents) == 1:
+                add_comment = isinstance(node.contents[0], nodes.NoOp)
+
+            if add_comment:
+                self._write("-- Nothing")
+                self._end_line()
 
     def leave_statements_list(self, node):
         self._pop_state()
@@ -437,14 +626,14 @@ class Visitor(traverse.Visitor):
 
     def visit_identifier(self, node):
         if node.type == nodes.Identifier.T_SLOT:
-            placeholder_identifier = "slot{0}"
-
-            # Fix placeholder slots before writing
             if node.slot == SLOT_FALSE:
-                placeholder_identifier = "false"
+                self._write("false")
             elif node.slot == SLOT_TRUE:
-                placeholder_identifier = "true"
-
+                self._write("true")
+            else:
+                self._write_slot(node)
+        elif not node.name and node.type == nodes.Identifier.T_UPVALUE:
+            placeholder_identifier = "uv{0}"
             self._write(placeholder_identifier, node.slot)
         else:
             self._write(node.name)
@@ -468,27 +657,25 @@ class Visitor(traverse.Visitor):
 
             return
 
-        base_is_constructor = isinstance(base, nodes.TableConstructor)
+        base_is_constructor = isinstance(base, nodes.TableConstructor) \
+                              or isinstance(base, OPERATOR_TYPES) \
+                              or (isinstance(base, nodes.Constant) and base.type == nodes.Constant.T_STRING)
 
-        if not base_is_constructor and is_valid_name:
-            self._visit(base)
+        if base_is_constructor:
+            self._write("(")
+
+        self._visit(base)
+
+        if base_is_constructor:
+            self._write(")")
+
+        if is_valid_name:
             self._write(".")
-
             self._write(key.value)
             self._skip(key)
         else:
-            if base_is_constructor:
-                self._write("(")
-
-            self._visit(base)
-
-            if base_is_constructor:
-                self._write(")")
-
             self._write("[")
-
             self._visit(key)
-
             self._write("]")
 
     def visit_vararg(self, node):
@@ -500,33 +687,32 @@ class Visitor(traverse.Visitor):
         if is_statement:
             self._start_statement(STATEMENT_FUNCTION_CALL)
 
-        # We are going to modify this list so we can remove the first
-        # argument
+        # We are going to modify this list so we can remove the first argument
         args = node.arguments.contents
-        is_method = False
 
-        if len(args) > 0 and isinstance(node.function, nodes.TableElement):
-            table = node.function.table
+        if node.is_method:
+            func = node.function
+            base = func.table
+            base_is_constructor = isinstance(base, nodes.TableConstructor) \
+                                  or isinstance(base, OPERATOR_TYPES) \
+                                  or (isinstance(base, nodes.Constant) and base.type == nodes.Constant.T_STRING)
 
-            first_arg = node.arguments.contents[0]
+            if base_is_constructor:
+                self._write("(")
 
-            if self._is_valid_name(node.function.key):
-                if hasattr(table, "name") and isinstance(first_arg, nodes.Identifier):
-                    if table.name == first_arg.name \
-                            and table.slot == first_arg.slot \
-                            and table.type == first_arg.type:
-                        is_method = True
-                else:
-                    is_method = table == first_arg
+            self._visit(base)
 
-        if is_method:
-            self._visit(node.function.table)
+            if base_is_constructor:
+                self._write(")")
+
             self._write(":")
-            self._write(node.function.key.value)
+
+            assert self._is_valid_name(func.key)
+
+            self._write(func.key.value)
+            self._skip(func.key)
 
             self._skip(node.function)
-
-            args.pop(0)
 
             self._write("(")
             self._visit(node.arguments)
@@ -618,7 +804,7 @@ class Visitor(traverse.Visitor):
 
     def visit_conditional_warp(self, node):
         if hasattr(node, "_slot"):
-            self._write("slot" + str(node._slot))
+            self._write_slot(node)
             self._write(" = ")
 
         self._write("if ")
@@ -730,7 +916,19 @@ class Visitor(traverse.Visitor):
         self._visit(node.variable)
         self._write(" = ")
 
-        self._visit(node.expressions)
+        # Manually visit the expressions so we have the option to skip the default increment
+        self._skip(node.expressions)
+
+        expressions = node.expressions.contents
+        assert len(expressions) == 3
+        if isinstance(expressions[2], nodes.Constant) and expressions[2].value == 1:
+            expressions = expressions[:-1]
+
+        for subnode in expressions[:-1]:
+            self._visit(subnode)
+            self._write(", ")
+
+        self._visit(expressions[-1])
 
         self._write(" do")
 
@@ -793,6 +991,16 @@ class Visitor(traverse.Visitor):
         else:
             self._write("nil")
 
+    def _visit_node(self, handler, node):
+        self._path.append(node)
+
+        traverse.Visitor._visit_node(self, handler, node)
+
+    def _leave_node(self, handler, node):
+        self._path.pop()
+
+        traverse.Visitor._leave_node(self, handler, node)
+
     def _skip(self, node):
         self._visited_nodes[-1].add(node)
 
@@ -800,7 +1008,13 @@ class Visitor(traverse.Visitor):
         assert node is not None
 
         if node in self._visited_nodes[-1]:
-            return
+            # This is necessary now because expression list nils share the same address, and are therefore ignored.
+            # Presumably because of
+            # https://gitlab.com/znixian/luajit-decompiler/-/commit/a26be731ee690020f03220ad4c003fadc42b408c
+            # TODO: Find some way to fix this at slotworks.py
+            if not (isinstance(node, nodes.Primitive) and
+                    node.type == nodes.Primitive.T_NIL and self.print_queue[-1][1] == ', '):
+                return
 
         self._visited_nodes[-1].add(node)
 
@@ -814,28 +1028,44 @@ class Visitor(traverse.Visitor):
             self._write("-- Decompilation error in this vicinity:")
             self._end_line()
 
+        if hasattr(node, "_line") and node._line:
+            line = node._line
+            self.line_token_map[line] = len(self.print_queue)
+
         traverse.Visitor._visit(self, node)
 
         self._visited_nodes.pop()
 
 
-def write(fd, ast):
+def write(fd, ast, generate_linemap=False):
     assert isinstance(ast, nodes.FunctionDefinition)
 
     visitor = Visitor()
 
     traverse.traverse(visitor, ast.statements)
 
-    _process_queue(fd, visitor.print_queue)
+    line_map = {}
+    token_map = _process_queue(fd, visitor.print_queue, visitor.line_token_map.values() if generate_linemap else None)
+
+    if generate_linemap:
+        for inline, tok in visitor.line_token_map.items():
+            line_map[inline] = token_map[tok]
+
+        return line_map
 
 
 def wrapped_write(fd, *objects, sep=' ', end='\n', file=sys.stdout):
-    enc = file.encoding
-    if enc == 'UTF-8':
-        fd.write(*objects)
-    else:
-        f = lambda obj: str(obj).encode(enc, errors='backslashreplace').decode(enc)
-        fd.write(*map(f, objects))
+    # TODO find out why this was added (asking Aussiemon might be a good place to start)
+    # For now, just write it without reencoding
+    # Also, it made the output platform-dependant, rather than being identical across platforms
+    fd.write(*objects)
+
+    # enc = fd.encoding
+    # if enc == 'UTF-8':
+    #     fd.write(*objects)
+    # else:
+    #     f = lambda obj: str(obj).encode(enc, errors='backslashreplace').decode(enc)
+    #     fd.write(*map(f, objects))
 
 
 def _get_next_significant(queue, i):
@@ -855,19 +1085,26 @@ def _get_next_significant(queue, i):
         return CMD_END_BLOCK,
 
 
-def _process_queue(fd, queue):
+def _process_queue(fd, queue, wanted_tokens):
     indent = 0
 
     line_broken = True
 
+    token_map = {}
+    line_num = 1
+
     for i, cmd in enumerate(queue):
         assert isinstance(cmd, tuple)
+
+        if wanted_tokens and i in wanted_tokens:
+            token_map[i] = line_num
 
         if cmd[0] == CMD_START_STATEMENT:
             # assert line_broken
             pass
         elif cmd[0] == CMD_END_STATEMENT:
             wrapped_write(fd, "\n")
+            line_num += 1
             line_broken = True
 
             next_cmd = _get_next_significant(queue, i)
@@ -879,8 +1116,10 @@ def _process_queue(fd, queue):
                         or cmd[1] >= STATEMENT_IF \
                         or next_cmd[1] >= STATEMENT_IF:
                     wrapped_write(fd, "\n")
+                    line_num += 1
         elif cmd[0] == CMD_END_LINE:
             wrapped_write(fd, "\n")
+            line_num += 1
             line_broken = True
         elif cmd[0] == CMD_START_BLOCK:
             indent += 1
@@ -905,3 +1144,5 @@ def _process_queue(fd, queue):
                 text = str(fmt)
 
             wrapped_write(fd, text)
+
+    return token_map

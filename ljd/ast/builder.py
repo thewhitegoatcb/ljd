@@ -4,9 +4,11 @@
 
 import ljd.ast.nodes as nodes
 import ljd.bytecode.instructions as ins
-import ljd.config.version_config
+import ljd
 from ljd.bytecode.constants import T_FALSE, T_NIL, T_TRUE
 from ljd.bytecode.helpers import get_jump_destination
+
+handle_invalid_functions = False
 
 
 class _State:
@@ -16,6 +18,7 @@ class _State:
         self.block = None
         self.blocks = []
         self.block_starts = {}
+        self.header = None
 
     def _warp_in_block(self, addr):
         block = self.block_starts[addr]
@@ -23,21 +26,25 @@ class _State:
         return block
 
 
-def build(prototype):
-    return _build_function_definition(prototype)
+def build(header, prototype):
+    return _build_function_definition(prototype, header)
 
 
-def _build_function_definition(prototype):
+def _build_function_definition(prototype, header):
     node = nodes.FunctionDefinition()
 
     state = _State()
 
     state.constants = prototype.constants
     state.debuginfo = prototype.debuginfo
+    state.header = header
 
     node._upvalues = prototype.constants.upvalue_references
     node._debuginfo = prototype.debuginfo
     node._instructions_count = len(prototype.instructions)
+
+    if prototype.first_line_number:
+        setattr(node, "_lineinfo", (prototype.first_line_number, prototype.lines_count))
 
     node.arguments.contents = _build_function_arguments(state, prototype)
 
@@ -76,16 +83,33 @@ def _build_function_blocks(state, instructions):
         addr = block.first_address
         state.block = block
 
-        while addr <= block._last_body_addr:
+        while addr <= block.last_address:
             instruction = instructions[addr]
 
-            statement = _build_statement(state, addr, instruction)
+            # Check if this is a loop
+            # We need to do this counting until block.last_address not block._last_body_addr, as otherwise
+            # we'll often miss stuff like FORI instructions that would otherwise be trimmed off.
+            opcode = instruction.opcode
+            if ins.LOOP.opcode <= opcode <= ins.JLOOP.opcode:
+                block.loop = True
+            elif ins.FORI.opcode <= opcode <= ins.JFORI.opcode:
+                block.loop = True
+
+            if addr > block._last_body_addr:
+                addr += 1
+                continue
+
+            statement, line_marked_elements = _build_statement(state, addr, instruction)
 
             if statement is not None:
                 line = state.debuginfo.lookup_line_number(addr)
 
-                setattr(statement, "_addr", addr)
-                setattr(statement, "_line", line)
+                if not line_marked_elements:
+                    line_marked_elements = []
+
+                for elem in line_marked_elements + [statement]:
+                    setattr(elem, "_addr", addr)
+                    setattr(elem, "_line", line)
 
                 block.contents.append(statement)
 
@@ -104,10 +128,9 @@ def _build_function_blocks(state, instructions):
     return state.blocks
 
 
-_JUMP_WARP_INSTRUCTIONS = {ins.UCLO.opcode, ins.ISNEXT.opcode, ins.JMP.opcode, ins.FORI.opcode, ins.JFORI.opcode}
-
-_WARP_INSTRUCTIONS = _JUMP_WARP_INSTRUCTIONS | {ins.FORL.opcode, ins.IFORL.opcode, ins.JFORL.opcode, ins.ITERL.opcode,
-                                                ins.IITERL.opcode, ins.JITERL.opcode, ins.LOOP.opcode}
+# Set in init() - see it's comment
+_JUMP_WARP_INSTRUCTIONS = None
+_WARP_INSTRUCTIONS = None
 
 
 def _blockenize(state, instructions):
@@ -184,12 +207,28 @@ def _establish_warps(state, instructions):
         start_addr = max(block.last_address - 1, block.first_address)
 
         # Catch certain double unconditional jumps caused by logical primitives in expressions:
-        if start_addr == (end_addr - 1) \
-                and end_addr + 1 < len(instructions) \
-                and instructions[start_addr].opcode == ins.JMP.opcode \
-                and instructions[end_addr].opcode == ins.JMP.opcode \
-                and instructions[start_addr].A == instructions[end_addr].A \
-                and instructions[start_addr].CD == 0:
+        # TODO: This fix has bad conditions. It fixes:
+        #     if x or false then
+        # 	    print("if or false")
+        #     end
+        #  and:
+        #     if var1 ~= "foo" and false then
+        #     end
+        #     if var2 ~= "bar" then
+        # 	    var1 = var2
+        #     end
+        #  but not:
+        #     if var1 ~= "foo" and false then
+        #     end
+        #     if var2("bar") then
+        # 	    var1 = var2
+        #     end
+        if False and (start_addr == (end_addr - 1)
+                      and end_addr + 1 < len(instructions)
+                      and instructions[start_addr].opcode == ins.JMP.opcode
+                      and instructions[end_addr].opcode == ins.JMP.opcode
+                      and instructions[start_addr].A == instructions[end_addr].A
+                      and instructions[start_addr].CD == 0):
 
             end_instruction_destination = end_addr + instructions[end_addr].CD + 1
             target_instruction_A = instructions[start_addr].A
@@ -205,7 +244,7 @@ def _establish_warps(state, instructions):
                         exit_instruction_found = True
                         break
 
-            # If we find the exit jump and we're not skipping it (if true then break else),
+            # If we find the exit jump, and we're not skipping it (if true then break else),
             #  form the original two jumps into a fake conditional warp.
             if exit_instruction_found \
                     and end_instruction_destination <= following_destination:
@@ -411,6 +450,15 @@ def _build_flow_warp(state, addr, instruction):
     return warp, shift
 
 
+def _assignment_marked(func):
+    def decorated(*args, **kwargs):
+        assn = func(*args, **kwargs)
+        assert isinstance(assn, nodes.Assignment)
+        return assn, assn.expressions.contents
+
+    return decorated
+
+
 def _build_statement(state, addr, instruction):
     opcode = instruction.opcode
     A_type = instruction.A_type
@@ -436,7 +484,7 @@ def _build_statement(state, addr, instruction):
     # ASSIGNMENT starting from TGETV and ending at TGETR
 
     elif opcode >= ins.TSETV.opcode and (opcode <= ins.TSETB.opcode
-                                         or (ljd.config.version_config.use_version > 2.0
+                                         or (ljd.CURRENT_VERSION > 2.0
                                              and opcode == ins.TSETR.opcode)):
         return _build_table_assignment(state, addr, instruction)
 
@@ -456,9 +504,11 @@ def _build_statement(state, addr, instruction):
         assert opcode == ins.UCLO.opcode or (
                 ins.LOOP.opcode <= opcode <= ins.JLOOP.opcode)
         # NoOp
-        return None
+        # TODO get the line no. for the loop set up
+        return None, None
 
 
+@_assignment_marked
 def _build_var_assignment(state, addr, instruction):
     opcode = instruction.opcode
 
@@ -468,8 +518,8 @@ def _build_var_assignment(state, addr, instruction):
     if opcode == ins.MOV.opcode \
             or opcode == ins.NOT.opcode \
             or opcode == ins.UNM.opcode \
-            or (ljd.config.version_config.use_version > 2.0 and opcode == ins.ISTYPE.opcode) \
-            or (ljd.config.version_config.use_version > 2.0 and opcode == ins.ISNUM.opcode) \
+            or (ljd.CURRENT_VERSION > 2.0 and opcode == ins.ISTYPE.opcode) \
+            or (ljd.CURRENT_VERSION > 2.0 and opcode == ins.ISNUM.opcode) \
             or opcode == ins.LEN.opcode:
         expression = _build_unary_expression(state, addr, instruction)
 
@@ -507,7 +557,7 @@ def _build_var_assignment(state, addr, instruction):
         expression = _build_global_variable(state, addr, instruction.CD)
 
     else:
-        if ljd.config.version_config.use_version > 2.0:
+        if ljd.CURRENT_VERSION > 2.0:
             assert opcode <= ins.TGETR.opcode
             expression = _build_table_element(state, addr, instruction)
         else:
@@ -528,6 +578,7 @@ def _build_var_assignment(state, addr, instruction):
     return assignment
 
 
+@_assignment_marked
 def _build_knil(state, addr, instruction):
     node = _build_range_assignment(state, addr, instruction.A, instruction.CD)
 
@@ -536,6 +587,7 @@ def _build_knil(state, addr, instruction):
     return node
 
 
+@_assignment_marked
 def _build_global_assignment(state, addr, instruction):
     assignment = nodes.Assignment()
 
@@ -548,6 +600,7 @@ def _build_global_assignment(state, addr, instruction):
     return assignment
 
 
+@_assignment_marked
 def _build_table_assignment(state, addr, instruction):
     assignment = nodes.Assignment()
 
@@ -560,6 +613,7 @@ def _build_table_assignment(state, addr, instruction):
     return assignment
 
 
+@_assignment_marked
 def _build_table_mass_assignment(state, addr, instruction):
     assignment = nodes.Assignment()
 
@@ -580,6 +634,8 @@ def _build_call(state, addr, instruction):
     call.function = _build_slot(state, addr, instruction.A)
     call.arguments.contents = _build_call_arguments(state, addr, instruction)
 
+    line_marked = [call]
+
     if instruction.opcode <= ins.CALL.opcode:
         if instruction.B == 0:
             node = nodes.Assignment()
@@ -597,10 +653,12 @@ def _build_call(state, addr, instruction):
         assert instruction.opcode <= ins.CALLT.opcode
         node = nodes.Return()
         node.returns.contents.append(call)
+        line_marked.append(node)
 
-    return node
+    return node, line_marked
 
 
+@_assignment_marked
 def _build_vararg(state, addr, instruction):
     base = instruction.A
     last_slot = base + instruction.B - 2
@@ -636,7 +694,7 @@ def _build_return(state, addr, instruction):
     if instruction.opcode == ins.RETM.opcode:
         node.returns.contents.append(nodes.MULTRES())
 
-    return node
+    return node, [node] + node.returns.contents
 
 
 def _build_call_arguments(state, addr, instruction):
@@ -652,6 +710,35 @@ def _build_call_arguments(state, addr, instruction):
     arguments = []
 
     slot = base + 1
+
+    # LJ_FR2 flag, required for 64-bit LuaJIT
+    # To the best of my knowledge, with this flag enabled there is a empty space on the
+    #  stack between the function and the arguments - when normally you would push the function
+    #  onto the stack followed by arguments, like so:
+    #
+    # /----------
+    # | 0. FUNCTION OBJ
+    # | 1. ARG1
+    # | 2. ARG2
+    # \----------
+    #
+    # With the flag enabled, it would go like so
+    #
+    # /----------
+    # | 0. FUNCTION OBJ
+    # | 1. <unused, reserved for runtime>
+    # | 2. ARG1
+    # | 3. ARG2
+    # \----------
+    #
+    # And thus we have to skip that bit
+    #
+    # (if you're curious about why it does this - it's to allow LuaJIT to store some pointers in the space
+    #  usually used by the stack contents. See https://github.com/LuaJIT/LuaJIT/issues/25#issuecomment-183660706 for
+    #  more information)
+    if state.header.flags.fr2:
+        slot += 1
+        last_argument_slot += 1
 
     while slot <= last_argument_slot:
         argument = _build_slot(state, addr, slot)
@@ -681,13 +768,8 @@ def _build_range_assignment(state, addr, from_slot, to_slot):
     return assignment
 
 
-_BINARY_OPERATOR_MAP = [None] * 255
-
-_BINARY_OPERATOR_MAP[ins.ADDVN.opcode] = nodes.BinaryOperator.T_ADD
-_BINARY_OPERATOR_MAP[ins.SUBVN.opcode] = nodes.BinaryOperator.T_SUBTRACT
-_BINARY_OPERATOR_MAP[ins.MULVN.opcode] = nodes.BinaryOperator.T_MULTIPLY
-_BINARY_OPERATOR_MAP[ins.DIVVN.opcode] = nodes.BinaryOperator.T_DIVISION
-_BINARY_OPERATOR_MAP[ins.MODVN.opcode] = nodes.BinaryOperator.T_MOD
+# Set in init() - see it's comment
+_BINARY_OPERATOR_MAP = None
 
 
 def _build_binary_expression(state, addr, instruction):
@@ -787,7 +869,14 @@ def _build_table_element(state, addr, instruction):
 def _build_function(state, slot):
     prototype = state.constants.complex_constants[slot]
 
-    return _build_function_definition(prototype)
+    try:
+        return _build_function_definition(prototype, state.header)
+    except Exception as err:
+        if not handle_invalid_functions:
+            raise err
+        fd = nodes.FunctionDefinition()
+        fd.error = err
+        return fd
 
 
 def _build_table_copy(state, slot):
@@ -842,26 +931,8 @@ def _build_table_record_item(value):
     return item
 
 
-_COMPARISON_MAP = [None] * 255
-
-# Mind the inversion - comparison operators are affecting JMP to the next block
-# So in the normal code a comparison will be inverted
-_COMPARISON_MAP[ins.ISLT.opcode] = nodes.BinaryOperator.T_GREATER_OR_EQUAL
-_COMPARISON_MAP[ins.ISGE.opcode] = nodes.BinaryOperator.T_LESS_THEN
-_COMPARISON_MAP[ins.ISLE.opcode] = nodes.BinaryOperator.T_GREATER_THEN
-_COMPARISON_MAP[ins.ISGT.opcode] = nodes.BinaryOperator.T_LESS_OR_EQUAL
-
-_COMPARISON_MAP[ins.ISEQV.opcode] = nodes.BinaryOperator.T_NOT_EQUAL
-_COMPARISON_MAP[ins.ISNEV.opcode] = nodes.BinaryOperator.T_EQUAL
-
-_COMPARISON_MAP[ins.ISEQS.opcode] = nodes.BinaryOperator.T_NOT_EQUAL
-_COMPARISON_MAP[ins.ISNES.opcode] = nodes.BinaryOperator.T_EQUAL
-
-_COMPARISON_MAP[ins.ISEQN.opcode] = nodes.BinaryOperator.T_NOT_EQUAL
-_COMPARISON_MAP[ins.ISNEN.opcode] = nodes.BinaryOperator.T_EQUAL
-
-_COMPARISON_MAP[ins.ISEQP.opcode] = nodes.BinaryOperator.T_NOT_EQUAL
-_COMPARISON_MAP[ins.ISNEP.opcode] = nodes.BinaryOperator.T_EQUAL
+# Set in init() - see it's comment
+_COMPARISON_MAP = None
 
 
 def _build_comparison_expression(state, addr, instruction):
@@ -906,9 +977,9 @@ def _build_unary_expression(state, addr, instruction):
         operator.type = nodes.UnaryOperator.T_NOT
     elif opcode == ins.UNM.opcode:
         operator.type = nodes.UnaryOperator.T_MINUS
-    elif ljd.config.version_config.use_version > 2.0 and opcode == ins.ISTYPE.opcode:
+    elif ljd.CURRENT_VERSION > 2.0 and opcode == ins.ISTYPE.opcode:
         operator.type = nodes.UnaryOperator.T_TOSTRING
-    elif ljd.config.version_config.use_version > 2.0 and opcode == ins.ISNUM.opcode:
+    elif ljd.CURRENT_VERSION > 2.0 and opcode == ins.ISNUM.opcode:
         operator.type = nodes.UnaryOperator.T_TONUMBER
     else:
         assert opcode == ins.LEN.opcode
@@ -935,9 +1006,9 @@ def _build_identifier(state, addr, slot, want_type):
     if want_type == nodes.Identifier.T_UPVALUE:
         name = state.debuginfo.lookup_upvalue_name(slot)
 
-        if name is not None:
-            node.name = name
-            node.type = want_type
+        # No problem if name is None, that'll be fixed in writer.Visitor.visit_identifier
+        node.name = name
+        node.type = want_type
 
     return node
 
@@ -1090,7 +1161,7 @@ def _fix_broken_repeat_until_loops(state, instructions):
                             checked_instruction_destination \
                                 = get_jump_destination(j, checked_instruction)
 
-                            # If the destination would've been moved
+                            # If the destination was moved
                             if checked_instruction.CD >= shift \
                                     and checked_instruction_destination == insertion_index + shift:
 
@@ -1199,7 +1270,7 @@ def _insert_instruction(state, instructions, index, new_instruction):
     # Offset
     shift = 1
 
-    # Update warp destinations with regards to the inserted instruction
+    # Update warp destinations with regard to the inserted instruction
     _shift_warp_destinations(state, instructions, shift, index)
 
     # Update variable info ranges
@@ -1213,7 +1284,7 @@ def _remove_instruction(state, instructions, index):
     # Offset
     shift = -1
 
-    # Update warp destinations with regards to the removed instruction
+    # Update warp destinations with regard to the removed instruction
     _shift_warp_destinations(state, instructions, shift, index)
 
     # Update variable info ranges
@@ -1227,7 +1298,11 @@ def _shift_warp_destinations(state, instructions, shift, modified_index):
         opcode = moved_instruction.opcode
 
         if opcode in _WARP_INSTRUCTIONS:
-            if current_index < modified_index and moved_instruction.CD >= 0:
+            # A non-branching UCLO should jump to the next instruction
+            if opcode == ins.UCLO.opcode and moved_instruction.CD == 0:
+                continue
+
+            elif current_index < modified_index and moved_instruction.CD >= 0:
                 destination = get_jump_destination(current_index, moved_instruction)
                 if destination > modified_index or (destination == modified_index and shift > 0):
                     moved_instruction.CD += shift
@@ -1248,3 +1323,53 @@ def _shift_debug_variable_info(state, shift, modified_index):
         if variable_info.start_addr > modified_index \
                 or (shift > 0 and variable_info.start_addr == modified_index):
             variable_info.start_addr += shift
+
+
+# Sets up _BINARY_OPERATOR_MAP and _COMPARISON_MAP
+# The reason we have to do it in the init method is due to
+# the new initialisation system for opcodes. Previously,
+# they were set by the order they were specified in ljd.bytecode.instructions,
+# but now their opcode fields are set by ljd.rawdump.code.init from the luajit_opcode
+# files. This will eventually allow the decompiler to switch between
+# different LuaJIT versions.
+def init():
+    global _BINARY_OPERATOR_MAP
+    global _COMPARISON_MAP
+
+    _BINARY_OPERATOR_MAP = [None] * 255
+
+    _BINARY_OPERATOR_MAP[ins.ADDVN.opcode] = nodes.BinaryOperator.T_ADD
+    _BINARY_OPERATOR_MAP[ins.SUBVN.opcode] = nodes.BinaryOperator.T_SUBTRACT
+    _BINARY_OPERATOR_MAP[ins.MULVN.opcode] = nodes.BinaryOperator.T_MULTIPLY
+    _BINARY_OPERATOR_MAP[ins.DIVVN.opcode] = nodes.BinaryOperator.T_DIVISION
+    _BINARY_OPERATOR_MAP[ins.MODVN.opcode] = nodes.BinaryOperator.T_MOD
+
+    _COMPARISON_MAP = [None] * 255
+
+    # Mind the inversion - comparison operators are affecting JMP to the next block
+    # So in the normal code a comparison will be inverted
+    _COMPARISON_MAP[ins.ISLT.opcode] = nodes.BinaryOperator.T_GREATER_OR_EQUAL
+    _COMPARISON_MAP[ins.ISGE.opcode] = nodes.BinaryOperator.T_LESS_THEN
+    _COMPARISON_MAP[ins.ISLE.opcode] = nodes.BinaryOperator.T_GREATER_THEN
+    _COMPARISON_MAP[ins.ISGT.opcode] = nodes.BinaryOperator.T_LESS_OR_EQUAL
+
+    _COMPARISON_MAP[ins.ISEQV.opcode] = nodes.BinaryOperator.T_NOT_EQUAL
+    _COMPARISON_MAP[ins.ISNEV.opcode] = nodes.BinaryOperator.T_EQUAL
+
+    _COMPARISON_MAP[ins.ISEQS.opcode] = nodes.BinaryOperator.T_NOT_EQUAL
+    _COMPARISON_MAP[ins.ISNES.opcode] = nodes.BinaryOperator.T_EQUAL
+
+    _COMPARISON_MAP[ins.ISEQN.opcode] = nodes.BinaryOperator.T_NOT_EQUAL
+    _COMPARISON_MAP[ins.ISNEN.opcode] = nodes.BinaryOperator.T_EQUAL
+
+    _COMPARISON_MAP[ins.ISEQP.opcode] = nodes.BinaryOperator.T_NOT_EQUAL
+    _COMPARISON_MAP[ins.ISNEP.opcode] = nodes.BinaryOperator.T_EQUAL
+
+    global _JUMP_WARP_INSTRUCTIONS
+    global _WARP_INSTRUCTIONS
+
+    _JUMP_WARP_INSTRUCTIONS = {ins.UCLO.opcode, ins.ISNEXT.opcode, ins.JMP.opcode, ins.FORI.opcode, ins.JFORI.opcode}
+
+    _WARP_INSTRUCTIONS = _JUMP_WARP_INSTRUCTIONS | {ins.FORL.opcode, ins.IFORL.opcode, ins.JFORL.opcode,
+                                                    ins.ITERL.opcode, ins.IITERL.opcode, ins.JITERL.opcode,
+                                                    ins.LOOP.opcode}

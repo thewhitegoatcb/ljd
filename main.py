@@ -26,43 +26,25 @@
 import logging
 import os
 import sys
+import struct
 from datetime import datetime
-from optparse import OptionParser
+from optparse import OptionParser, OptionGroup
+from shutil import copyfile
 
+import ljd.rawdump.parser
+import ljd.rawdump.code
+import ljd.pseudoasm.writer
+import ljd.pseudoasm.instructions
+import ljd.ast.builder
+import ljd.ast.slotworks
+import ljd.ast.validator
+import ljd.ast.locals
+import ljd.ast.unwarper
+import ljd.ast.mutator
+import ljd.ast.printast
+import ljd.lua.writer
 
-def dump(name, obj, level=0):
-    indent = level * '\t'
-
-    if name is not None:
-        prefix = indent + name + " = "
-    else:
-        prefix = indent
-
-    if isinstance(obj, (int, float, str)):
-        print(prefix + str(obj))
-    elif isinstance(obj, list):
-        print(prefix + "[")
-
-        for value in obj:
-            dump(None, value, level + 1)
-
-        print(indent + "]")
-    elif isinstance(obj, dict):
-        print(prefix + "{")
-
-        for key, value in obj.items():
-            dump(key, value, level + 1)
-
-        print(indent + "}")
-    else:
-        print(prefix + obj.__class__.__name__)
-
-        for key in dir(obj):
-            if key.startswith("__"):
-                continue
-
-            val = getattr(obj, key)
-            dump(key, val, level + 1)
+import ljd.ast.nodes as nodes
 
 
 class MakeFileHandler(logging.FileHandler):
@@ -71,8 +53,27 @@ class MakeFileHandler(logging.FileHandler):
         logging.FileHandler.__init__(self, filename, *args, **kwargs)
 
 
+def set_luajit_version(bc_version):
+    # If we're already on this version, skip resetting everything
+    if ljd.CURRENT_VERSION == bc_version:
+        return
+
+    ljd.CURRENT_VERSION = bc_version
+    # Now we know the LuaJIT version, initialise the opcodes
+    if bc_version == 2.0:
+        from ljd.rawdump.luajit.v2_0.luajit_opcode import _OPCODES as opcodes
+    elif bc_version == 2.1:
+        from ljd.rawdump.luajit.v2_1.luajit_opcode import _OPCODES as opcodes
+    else:
+        raise Exception("Unknown LuaJIT opcode module name for version " + str(bc_version))
+
+    ljd.rawdump.code.init(opcodes)
+    ljd.ast.builder.init()
+    ljd.pseudoasm.instructions.init()
+
+
 class Main:
-    def main(self):
+    def __init__(self):
         # Parser arguments
         parser = OptionParser()
 
@@ -81,77 +82,136 @@ class Main:
                           type="string", dest="file_name", default="",
                           help="input file name", metavar="FILE")
 
-        # Single file output destination. Not to be used with -r
-        parser.add_option("-o", "--output",
-                          type="string", dest="output_file", default="",
-                          help="output file for writing", metavar="FILE")
-
         # Directory in which to recurse and process all files. Not to be used with -f
         parser.add_option("-r", "--recursive",
                           type="string", dest="folder_name", default="",
                           help="recursively decompile lua files", metavar="FOLDER")
 
-        # Directory to output processed files during recursion. Not to be used with -f
+        # Single file output destination. Not to be used with -r
+        parser.add_option("-o", "--output",
+                          type="string", dest="output", default="",
+                          help="output file for writing")
+
+        # LEGACY OPTION. Directory to output processed files during recursion. Not to be used with -f
         parser.add_option("-d", "--dir_out",
                           type="string", dest="folder_output", default="",
-                          help="directory to output decompiled lua scripts", metavar="FOLDER")
+                          help="LEGACY OPTION. directory to output decompiled lua scripts", metavar="FOLDER")
 
-        # Global override of LuaJIT version, ignores -j
-        parser.add_option("-j", "--jit_version",
-                          type="string", dest="luajit_version", default="",
-                          help="override LuaJIT version, default 2.1, now supports 2.0, 2.1")
+        # Allow overriding the default .lua file extension (e.g. when binary lua files are saved as .luac)
+        parser.add_option("-e", "--file-extension",
+                          type="string", dest="lua_ext", default=".lua",
+                          help="file extension filter for recursive searches", metavar="EXT")
 
-        # 'Profiles' that hardcode LuaJIT versions per file
-        parser.add_option("-v", "--version_config_list",
-                          type="string", dest="version_config_list", default="version_default",
-                          help="LuaJIT version config list to use")
+        # Prefer raw source files when available? The PAYDAY games sometimes come with .lua_source files.
+        parser.add_option("--prefer_sources",
+                          type="string", dest="lua_src_ext", default="",
+                          help="use source files", metavar="EXT")
 
         # Prevent most integrity asserts from canceling decompilation
         parser.add_option("-c", "--catch_asserts",
                           action="store_true", dest="catch_asserts", default=False,
                           help="attempt inline error reporting without breaking decompilation")
 
+        # Include line number comments for function definitions
+        parser.add_option("--with-line-numbers",
+                          action="store_true", dest="include_line_numbers", default=False,
+                          help="add comments with line numbers for function definitions")
+
+        # Single file linemap output
+        parser.add_option("--line-map-output",
+                          type="string", dest="line_map_output_file", default="",
+                          help="line map output file for writing", metavar="FILE")
+
+        # Some previous luajit compilers produced some unexpected instructions that are not handled by the regular
+        # process. If we bypass some of the safety checks, we may be able to deal with them correctly. This works
+        # for PAYDAY 2 and RAID, but may have unexpected side effects for other projects. On by default.
+        parser.add_option("--unsafe", type="string", dest="unsafe_extra_pass", default="true",
+                          help="unsafe extra pass to try to correct some leftover values")
+
+        # Control over various parts of writer output
+        parser.add_option("--function_def_sugar", type="string", dest="function_def_sugar", default="true",
+                          help="write function defintions as \"function <name>()\" instead of \"<name> = function ()\""
+                               " (false implies function_def_self_arg = true)")
+        parser.add_option("--function_def_self_arg", type="string", dest="function_def_self_arg", default="false",
+                          help="include self in function definition arguments")
+
+        group = OptionGroup(parser, "Debug Options")
+
         # Output a log of exceptions and information during decompilation
         parser.add_option("-l", "--enable_logging",
                           action="store_true", dest="enable_logging", default=False,
                           help="log info and exceptions to external file while decompiling")
 
-        # Output pseudo-asm to a file during decompilation
-        parser.add_option("-A", "--pseudo-asm",
-                          type="string", dest="pseudoasm", default="",
-                          help="output pseudoasm file name", metavar="FILE")
+        group.add_option("-v", "--verbose", action="store_true", dest="verbose", default=False, help="verbose")
+
+        # Skip some processing steps
+        group.add_option("--no-unwarp", action="store_true", dest="no_unwarp", default=False,
+                         help="do not run the unwarper")
+
+        # Output the pseudoasm of the initial AST instead of decompiling the input
+        group.add_option("--asm", action="store_true", dest="print_pseudoasm", default=False, help="Print pseudo asm")
+        group.add_option("--output-asm", type="string", dest="output_pseudoasm", default="",
+                         help="Output pseudo asm to file name", metavar="FILE")
+
+        group.add_option("--dump", action="store_true", dest="dump_ast", default=False, help="Dump AST")
 
         (self.options, args) = parser.parse_args()
 
-        # Initialize opcode set for required LuaJIT version
-        basepath = os.path.dirname(sys.argv[0])
-        if basepath == "":
-            basepath = "."
-        if self.options.luajit_version == "":
-            version_required = self.check_for_version_config(self.options.file_name)
-            sys.path.append(basepath + "/ljd/rawdump/luajit/" + str(version_required) + "/")
-        else:
-            self.set_version_config(float(self.options.luajit_version))
-            sys.path.append(basepath + "/ljd/rawdump/luajit/" + self.options.luajit_version + "/")
+        # Allow the input argument to be either a folder or a file.
+        if len(args) == 1:
+            if self.options.file_name or self.options.folder_name:
+                parser.error("Conflicting file arguments.")
+                sys.exit(1)
 
-        # LuaJIT version is known after the argument is parsed, so delay module import.
-        import ljd.rawdump.parser
-        import ljd.pseudoasm.writer
-        import ljd.ast.builder
-        import ljd.ast.validator
-        import ljd.ast.locals
-        import ljd.ast.slotworks
-        import ljd.ast.unwarper
-        import ljd.ast.mutator
-        import ljd.lua.writer
+            if os.path.isdir(args[0]):
+                self.options.folder_name = args[0]
+            else:
+                self.options.file_name = args[0]
+        elif len(args) > 1:
+            parser.error("Too many arguments.")
+            sys.exit(1)
 
-        # Send assert catch argument to modules
+        # Verify arguments
+        if self.options.folder_name:
+            pass
+        elif not self.options.file_name:
+            parser.error("Options -f or -r are required.")
+            sys.exit(1)
+
+        # Determine output folder/file
+        if self.options.folder_output:
+            if not self.options.output:
+                self.options.output = self.options.folder_output
+            self.options.folder_output = None
+
+        if self.options.output:
+            if self.options.folder_name:
+                if os.path.isfile(self.options.output):
+                    parser.error("Output folder is a file.")
+                    sys.exit(0)
+
+        # TODO merge into the module handling below
         if self.options.catch_asserts:
-            ljd.ast.unwarper.catch_asserts = True
-            ljd.ast.slotworks.catch_asserts = True
-            ljd.ast.validator.catch_asserts = True
+            ljd.ast.builder.handle_invalid_functions = True
 
-        self.ljd = ljd
+        for mod in [ljd.ast.unwarper, ljd.ast.slotworks, ljd.ast.validator, ljd.ast.mutator]:
+            if self.options.dump_ast:
+                mod.debug_dump = True
+            if self.options.catch_asserts:
+                mod.catch_asserts = True
+            if self.options.verbose:
+                mod.verbose = True
+
+        if self.options.include_line_numbers:
+            ljd.lua.writer.show_line_info = True
+
+        if self.options.function_def_sugar.lower() in ['true', '1', 't', 'y', 'yes']:
+            ljd.lua.writer.use_function_definition_syntactic_sugar = True
+
+        if self.options.function_def_self_arg.lower() in ['true', '1', 't', 'y', 'yes']:
+            ljd.lua.writer.write_function_definition_self_arg = True
+
+        self.options.unsafe_extra_pass = self.options.unsafe_extra_pass.lower() in ['true', '1', 't', 'y', 'yes']
 
         # Start logging if required
         if self.options.enable_logging:
@@ -172,143 +232,243 @@ class Main:
         else:
             logger = None
 
+        self.logger = logger
+
+    def main(self):
         # Recursive batch processing
         if self.options.folder_name:
-            if self.options.version_config_list != "version_default":
-                print(self.options)
-                print("Version config lists are not supported in recursive directory mode.")
-                if self.options.enable_logging:
-                    logger.info("Exit")
-                return 0
+            self.options.folder_name = os.path.sep.join(os.path.normpath(self.options.folder_name).split('\\'))
+            for path, _, file_names in os.walk(self.options.folder_name):
+                for file in file_names:
+                    # Skip files we're not interested in based on the extension
+                    if not file.endswith(self.options.lua_ext):
+                        continue
 
-            for path, _, filenames in os.walk(self.options.folder_name):
-                for file in filenames:
-                    if file.endswith('.lua'):
-                        full_path = os.path.join(path, file)
+                    full_path = os.path.join(path, file)
 
+                    # Copy raw source files?
+                    if self.options.enable_logging:
+                        self.logger.info(full_path)
+                    try:
+                        if self.options.lua_src_ext:
+                            src_file = os.path.splitext(file)[0] + "." + self.options.lua_src_ext
+                            full_src_path = os.path.join(path, src_file)
+                            if os.path.exists(full_src_path) and os.path.getsize(full_src_path) > 0:
+                                if self.options.enable_logging:
+                                    self.logger.info("Skipping {0}: Source file available.".format(full_path))
+
+                                new_path = os.path.join(self.options.output,
+                                                        os.path.relpath(full_path, self.options.folder_name))
+                                os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                                if not file.endswith('.lua'):
+                                    new_path = new_path[:-1]
+                                copyfile(full_src_path, new_path)
+                                if self.options.enable_logging:
+                                    self.logger.info("Success")
+                                continue
+                    except (KeyboardInterrupt, SystemExit):
+                        print("Interrupted")
+                        sys.stdout.flush()
                         if self.options.enable_logging:
-                            logger.info(full_path)
-                        try:
-                            self.decompile(full_path)
-                            new_path = os.path.join(self.options.folder_output,
-                                                    os.path.relpath(full_path, self.options.folder_name))
-                            os.makedirs(os.path.dirname(new_path), exist_ok=True)
-                            self.write_file(new_path)
-                            if self.options.enable_logging:
-                                logger.info("Success")
-                        except KeyboardInterrupt:
-                            if self.options.enable_logging:
-                                logger.info("Exit")
-                            return 0
-                        except:
-                            if self.options.enable_logging:
-                                logger.info("Exception")
-                                logger.debug('', exc_info=True)
+                            self.logger.info("Exit")
+                        return 0
+                    except OSError as exc:
+                        print("\n--; Exception in %s" % full_path)
+                        print("-- %s" % exc)
+                        if self.options.enable_logging:
+                            self.logger.info("OS Exception")
+                            self.logger.debug('', exc_info=True)
+                        continue
 
+                    # Process current file
+                    try:
+                        self.process_file(file, full_path, self.logger)
+                    except (KeyboardInterrupt, SystemExit):
+                        print("Interrupted")
+                        sys.stdout.flush()
+                        if self.options.enable_logging:
+                            self.logger.info("Exit")
+                        return 0
+                    except Exception as exc:
+                        print("\n--; Exception in {0}".format(full_path))
+                        print(exc)
+                        if self.options.enable_logging:
+                            self.logger.info("Exception")
+                            self.logger.debug('', exc_info=True)
             return 0
 
         # Single file processing
-        if self.options.file_name == "":
-            print(self.options)
-            parser.error("Options -f or -r are required.")
-            return 0
+        ast = self.decompile(self.options.file_name)
 
-        self.decompile(self.options.file_name)
+        if not ast:
+            return 1
 
-        if self.options.output_file:
-            self.write_file(self.options.output_file)
-        else:
-            self.ljd.lua.writer.write(sys.stdout, self.ast)
+        generate_linemap = bool(self.options.line_map_output_file)
+
+        if not self.options.print_pseudoasm:
+            if self.options.output:
+                output_file = self.options.output
+                if os.path.isdir(output_file):
+                    output_file = os.path.join(
+                        output_file, os.path.splitext(os.path.basename(self.options.file_name))[0], ".lua"
+                    )
+                line_map = self.write_file(ast, output_file, generate_linemap=generate_linemap)
+            else:
+                line_map = ljd.lua.writer.write(sys.stdout, ast, generate_linemap=generate_linemap)
+
+            if self.options.line_map_output_file:
+                with open(self.options.line_map_output_file, "wb") as lm_out:
+                    for from_line in sorted(line_map):
+                        to_line = line_map[from_line]
+                        lm_out.write(struct.pack("!II", from_line, to_line))
 
         return 0
 
-    def write_file(self, file_name):
+    def process_file(self, file, full_path, logger):
+        try:
+            ast = self.decompile(full_path)
+
+            if not self.options.output:
+                print("\n--; Decompile of {0}".format(full_path))
+                ljd.lua.writer.write(sys.stdout, ast)
+                self.lock.release()
+                return 0
+
+            new_path = os.path.join(self.options.output, os.path.relpath(full_path, self.options.folder_name))
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            if not file.endswith('.lua'):
+                new_path = new_path[:-1]
+            self.write_file(ast, new_path)
+            if self.options.enable_logging:
+                logger.info("Success")
+            return 0
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise
+        return 1
+
+    def write_file(self, ast, file_name, **kwargs):
+        if self.options.enable_logging:
+            self.logger.debug("Writing file {0}...".format(file_name))
         with open(file_name, "w", encoding="utf8") as out_file:
-            self.ljd.lua.writer.write(out_file, self.ast)
+            return ljd.lua.writer.write(out_file, ast, **kwargs)
 
     def decompile(self, file_in):
-        header, prototype = self.ljd.rawdump.parser.parse(file_in)
+        def on_parse_header(preheader):
+            # Identify the version of LuaJIT used to compile the file
+            bc_version = None
+            if preheader.version == 1:
+                bc_version = 2.0
+            elif preheader.version == 2:
+                bc_version = 2.1
+            elif preheader.version == 130:
+                bc_version = 2.1
+            else:
+                raise Exception("Unsupported bytecode version: " + str(bc_version))
+
+            set_luajit_version(bc_version)
+
+        header, prototype = ljd.rawdump.parser.parse(file_in, on_parse_header)
 
         if not prototype:
             return 1
 
-        if self.options.pseudoasm:
-            with open(self.options.pseudoasm, "w", encoding="utf8") as out_file:
-                self.ljd.pseudoasm.writer.write(out_file, header, prototype)
+        if self.options.print_pseudoasm:
+            ljd.pseudoasm.writer.write(sys.stdout, header, prototype)
 
-        self.ast = self.ljd.ast.builder.build(prototype)
+        if self.options.output_pseudoasm:
+            with open(self.options.output_pseudoasm, "w", encoding="utf8") as out_file:
+                ljd.pseudoasm.writer.write(out_file, header, prototype)
 
-        assert self.ast is not None
+        ast = ljd.ast.builder.build(header, prototype)
 
-        self.ljd.ast.validator.validate(self.ast, warped=True)
+        assert ast is not None
 
-        self.ljd.ast.mutator.pre_pass(self.ast)
+        ljd.ast.validator.validate(ast, warped=True)
 
-        # self.ljd.ast.validator.validate(self.ast, warped=True)
+        ljd.ast.mutator.pre_pass(ast)
 
-        self.ljd.ast.locals.mark_locals(self.ast)
+        ljd.ast.validator.validate(ast, warped=True)
 
-        # self.ljd.ast.validator.validate(self.ast, warped=True)
+        ljd.ast.locals.mark_locals(ast)
+
+        if self.options.dump_ast:
+            ljd.ast.printast.dump("AST [locals]", ast)
+            return
 
         try:
-            self.ljd.ast.slotworks.eliminate_temporary(self.ast)
-        except:
+            ljd.ast.slotworks.eliminate_temporary(ast, identify_slots=True)
+        except AssertionError:
             if self.options.catch_asserts:
-                print("-- Decompilation Error: self.ljd.ast.slotworks.eliminate_temporary(self.ast)\n", file=sys.stdout)
+                print("-- Decompilation Error: ljd.ast.slotworks.eliminate_temporary(ast)\n", file=sys.stdout)
             else:
                 raise
 
-        # self.ljd.ast.validator.validate(self.ast, warped=True)
+        # ljd.ast.validator.validate(ast, warped=True)
 
-        if True:
-            self.ljd.ast.unwarper.unwarp(self.ast)
+        if not self.options.no_unwarp:
+            ljd.ast.unwarper.unwarp(ast, False)
 
-            # self.ljd.ast.validator.validate(self.ast, warped=False)
+            # ljd.ast.validator.validate(ast, warped=False)
 
             if True:
-                self.ljd.ast.locals.mark_local_definitions(self.ast)
+                ljd.ast.locals.mark_local_definitions(ast)
 
-                # self.ljd.ast.validator.validate(self.ast, warped=False)
+                # ljd.ast.validator.validate(ast, warped=False)
 
-                self.ljd.ast.mutator.primary_pass(self.ast)
+                ljd.ast.mutator.primary_pass(ast)
 
                 try:
-                    self.ljd.ast.validator.validate(self.ast, warped=False)
-                except:
+                    ljd.ast.validator.validate(ast, warped=False)
+                except AssertionError:
                     if self.options.catch_asserts:
-                        print("-- Decompilation Error: self.ljd.ast.validator.validate(self.ast, warped=False)\n",
+                        print("-- Decompilation Error: ljd.ast.validator.validate(ast, warped=False)\n",
                               file=sys.stdout)
                     else:
                         raise
 
-    def check_for_version_config(self, file_name):
-        import ljd.config.version_config as version_config_file
+                if True:
+                    # Mark remaining (unused) locals in empty loops, before blocks and at the end of functions
+                    ljd.ast.locals.mark_locals(ast, alt_mode=True)
+                    ljd.ast.locals.mark_local_definitions(ast)
 
-        # Transform file_name with present working directory
-        if len(file_name) > 0 and file_name[0] == ".":
-            file_name = file_name.replace(".", "", 1)
-        file_name = os.getcwd() + "/" + file_name
-        file_name = file_name.replace("\\", "/")
-        file_name = file_name.replace("//", "/")
+                    # Extra (unsafe) slot elimination pass (iff debug info is available) to deal with compiler issues
+                    for ass in ast.statements.contents if self.options.unsafe_extra_pass else []:
+                        if not isinstance(ass, nodes.Assignment):
+                            continue
 
-        # Get version config list or default
-        try:
-            version_list = version_config_file._LUA_FILE_VERSIONS[self.options.version_config_list]
-        except KeyError:
-            version_list = version_config_file._LUA_FILE_VERSIONS["version_default"]
+                        for node in ass.expressions.contents:
+                            if not getattr(node, "_debuginfo", False) or not node._debuginfo.variable_info:
+                                continue
 
-        # Search for a matching entry
-        for config_entry_name in version_list:
-            if config_entry_name in file_name:
-                self.set_version_config(version_list[config_entry_name])
-                break
+                            contents = None
+                            if isinstance(node, nodes.FunctionDefinition):
+                                contents = [node.statements.contents]
+                            elif isinstance(node, nodes.TableConstructor):
+                                contents = [node.array.contents, node.records.contents]
+                            else:
+                                continue
 
-        return version_config_file.use_version
+                            # Check for any remaining slots
+                            try:
+                                for content_list in contents:
+                                    for subnode in content_list:
+                                        if isinstance(subnode, nodes.Assignment):
+                                            for dst in subnode.destinations.contents:
+                                                if isinstance(dst, nodes.Identifier) and dst.type == dst.T_SLOT:
+                                                    raise StopIteration
+                            except StopIteration:
+                                ljd.ast.slotworks.eliminate_temporary(node, unwarped=True, safe_mode=False)
 
-    @staticmethod
-    def set_version_config(version_number):
-        import ljd.config.version_config
-        ljd.config.version_config.use_version = version_number
+                                # Manual cleanup
+                                for content_list in contents:
+                                    j = len(content_list) - 1
+                                    for i, subnode in enumerate(reversed(content_list)):
+                                        if getattr(subnode, "_invalidated", False):
+                                            del content_list[j - i]
+
+        return ast
 
 
 if __name__ == "__main__":

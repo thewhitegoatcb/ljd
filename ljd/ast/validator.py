@@ -4,6 +4,7 @@
 
 import ljd.ast.nodes as nodes
 import ljd.ast.traverse as traverse
+import ljd
 
 catch_asserts = False
 
@@ -70,6 +71,10 @@ VARIABLE_TYPES = (
     nodes.Identifier,
     nodes.TableElement,
     nodes.MULTRES  # It's not valid here, but it is a hack anyway...
+)
+
+IDENTIFIER = (
+    nodes.Identifier,
 )
 
 WARP_TYPES = (
@@ -154,14 +159,12 @@ class Visitor(traverse.Visitor):
                or node.type == nodes.BinaryOperator.T_POW
 
     def visit_unary_operator(self, node):
-        import ljd.config.version_config
-
         self._set_restrictions(EXPRESSION_TYPES)
 
         assert node.type == nodes.UnaryOperator.T_NOT \
             or node.type == nodes.UnaryOperator.T_LENGTH_OPERATOR \
             or node.type == nodes.UnaryOperator.T_MINUS \
-            or (ljd.config.version_config.use_version > 2.0
+            or (ljd.CURRENT_VERSION > 2.0
                 and (node.type == nodes.UnaryOperator.T_TOSTRING
                      or node.type == nodes.UnaryOperator.T_TONUMBER))
 
@@ -217,10 +220,14 @@ class Visitor(traverse.Visitor):
         self._set_restrictions(EXPRESSION_TYPES)
 
     def visit_function_call(self, node):
+        # Originally node.function had to be a variable type, but that's too strict - something
+        #  like `loadstring(...)()` is perfectly valid.
+
         self._set_restrictions({
-            node.function: VARIABLE_TYPES,
+            node.function: EXPRESSION_TYPES,
             node.arguments: nodes.ExpressionsList
         })
+        assert node._line is not None
 
     # ##
 
@@ -294,6 +301,7 @@ class Visitor(traverse.Visitor):
 
     def visit_return(self, node):
         self._set_restrictions(nodes.ExpressionsList)
+        assert node._line is not None
 
     # ##
 
@@ -313,7 +321,7 @@ class Visitor(traverse.Visitor):
         self._set_restrictions({
             node.expressions: nodes.ExpressionsList,
             node.statements: nodes.StatementsList,
-            node.variable: VARIABLE_TYPES
+            node.variable: IDENTIFIER
         })
 
     def visit_iterator_for(self, node):

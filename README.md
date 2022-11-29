@@ -17,7 +17,7 @@ decompile the decompiler — a great test too!
 Requirements:
 ---
 
-Python __3.0+__ from Python.org
+Python __3.7+__ from Python.org
 
 
 How To Use:
@@ -25,9 +25,22 @@ How To Use:
 
 Typical usage (no version configuration list, all files in a directory):
 ```
-python ./ljd/main.py --recursive ./<input directory> --dir_out ./<output directory> --catch_asserts
+python3 ./main.py --recursive ./<input directory> --dir_out ./<output directory> --catch_asserts
 ```
 
+Note About Bytecode Versions:
+---
+
+Different versions of LuaJIT produce different versions of the bytecode. Currently revision
+`1` (corresponding to LuaJIT 2.0.x) and revision `2` (corresponding to LuaJIT 2.1.x) are supported.
+
+These are the only two versions officially used in LuaJIT. From time to time I've seen files
+with a revision code of `3` pop up. This appears to be from RaptorJIT, but more investigation
+in that area is needed.
+
+In previous versions of the decompiler, you had to manually specify the version of the files
+you are decompiling. This is now done automatically, although there may be bugs when using
+the `-r` option with files coming from multiple versions of LuaJIT.
 
 Arguments:
 ---
@@ -39,10 +52,6 @@ Arguments:
 "-r", "--recursive" : Directory in which to recurse and process all files. Not to be used with "-f"
 
 "-d", "--dir_out" : Directory to output processed files during recursion. Not to be used with "-f"
-
-"-j", "--jit_version" : Global override of LuaJIT version, ignores -j, currently supports 2.1b3, 2.0
-
-"-v", "--version_config_list" : 'Profiles' that hardcode LuaJIT versions per file, ljd.config.version_config.py
 
 "-c", "--catch_asserts" : Prevent most integrity asserts from canceling decompilation
 
@@ -61,19 +70,17 @@ TODO:
 There is a lot of work to do. In order of priority:
 
 0. Logical subexpressions in while statements:
+	This is done! As far as I'm aware, this is the only available LuaJIT decompiler
+	that can decompile stuff like the following:
+
 	```lua
 		while x < (xi and 2 or 3) do
 			print ("Hello crazy world!")
 		end
 	```
 
-	Logical subexpressions (the subexpressions used as operands in
-	ariphmetic or comparison operations inside other expressions) are
-	currently supported only for ifs. To support them for whiles and
-	repeat-untils, the expression unwarping logic should be moved to the
-	very beginning. This won't work without all the fixes in
-	the loop unwarping logic, so we need to split that and move the fixes
-	before expressions, before loops, before ifs. That's not that easy...
+	If you're having many failures while decompiling files via other forks of LJD, this
+	is quite likely going to solve 90% of your problems.
 
 1. AST Mutations:
 	1. Use the line information (or common sense if there is no line
@@ -100,3 +107,13 @@ There is a lot of work to do. In order of priority:
 	   Simple enough in case of non-stripped bytecode, but a bit
 	   harder otherwise.
 
+Licence:
+---
+
+The original LJD is distributed under the MIT licence, and a
+copy of this is included as `LICENSE-upstream`. However, all changes made by Campbell "ZNixian" Suter and subsequent changes by me are licenced under the GNU General Public Licence, version 3 or any later
+version of your choice (a copy of which is available in the `LICENSE` file supplied with the source code).
+
+This licence was chosen due to certain dynamics of the videogame modding scene for which these changes
+were made. If you have a use for this outside of games, and need a less restrictive licence, please let Campbell "ZNixian" Suter know
+as he'll most likely be fine to relicence the project either to MIT or (preferrably) LGPL.

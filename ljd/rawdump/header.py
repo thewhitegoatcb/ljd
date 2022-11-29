@@ -5,8 +5,9 @@
 from ljd.util.log import errprint
 
 _MAGIC = b'\x1bLJ'
+_FATSHARK_MAGIC = b'\x1bFS'
 
-_MAX_VERSION = 0x80
+_MAX_VERSION = 0x82
 
 _FLAG_IS_BIG_ENDIAN = 0b00000001
 _FLAG_IS_STRIPPED = 0b00000010
@@ -45,7 +46,8 @@ def read(state, header):
 
 
 def _check_magic(state):
-    if state.stream.read_bytes(3) != _MAGIC:
+    magic_bytes = state.stream.read_bytes(3)
+    if magic_bytes != _MAGIC and magic_bytes != _FATSHARK_MAGIC:
         errprint("Invalid magic, not a LuaJIT format")
         return False
 

@@ -15,6 +15,10 @@ class FunctionDefinition:
         self._debuginfo = None
         self._instructions_count = 0
 
+        # If there was an exception parsing this function (eg, invalid bytecodes) and catch asserts is
+        # enabled, the parsing error will be stored here and the rest of the function will be left empty.
+        self.error = None
+
     def _accept(self, visitor):
         visitor._visit_node(visitor.visit_function_definition, self)
 
@@ -127,6 +131,16 @@ class BinaryOperator:
 
     T_POW = 70  # left ^ right
 
+    # Precedences are shared with UnaryOperator
+    PR_OR = 1
+    PR_AND = 2
+    PR_COMPARISON = 3
+    PR_CONCATENATE = 4
+    PR_MATH_ADDSUB = 5
+    PR_MATH = 6
+    PR_UNARY = 7
+    PR_EXPONENT = 8
+
     def __init__(self):
         self.type = -1
         self.left = None
@@ -140,17 +154,90 @@ class BinaryOperator:
 
         visitor._leave_node(visitor.leave_binary_operator, self)
 
+    # Use this instead of the type field, as stuff like + and - have the same precedence this way
+    def precedence(self):
+        # Note that print(1 or 2 and false) prints 1
+        if self.type <= self.T_LOGICAL_OR:
+            return BinaryOperator.PR_OR
+
+        elif self.type <= self.T_LOGICAL_AND:
+            return BinaryOperator.PR_AND
+
+        elif self.type <= self.T_EQUAL:
+            return BinaryOperator.PR_COMPARISON
+
+        elif self.type <= self.T_CONCAT:
+            return BinaryOperator.PR_CONCATENATE
+
+        elif self.type <= self.T_SUBTRACT:
+            return BinaryOperator.PR_MATH_ADDSUB
+
+        elif self.type <= self.T_MOD:
+            return BinaryOperator.PR_MATH
+
+        elif self.type <= self.T_POW:
+            return BinaryOperator.PR_EXPONENT
+
+        else:
+            assert False
+
+    def is_right_associative(self):
+        if self.type == self.T_CONCAT:
+            # Although this is right-associative per the Lua manual, since that
+            #  doesn't matter here since `("a" .. "b") .. "c"` is the same as `"a" .. ("b" .. "c")`,
+            #  LuaJIT doesn't consider it to be right-associative and thus groups it accordingly. Hence,
+            #  setting this to True results in unnecessary braces being introduced.
+            return False
+
+        elif self.type == self.T_POW:
+            return True
+
+        else:
+            return False
+
+    def is_commutative(self):
+        if self.type <= self.T_LOGICAL_AND:
+            return True
+
+        elif self.type <= self.T_GREATER_OR_EQUAL:
+            return False
+
+        elif self.type <= self.T_EQUAL:
+            return True
+
+        elif self.type <= self.T_CONCAT:
+            return False
+
+        elif self.type <= self.T_ADD:
+            return True
+
+        elif self.type <= self.T_SUBTRACT:
+            return False
+
+        elif self.type <= self.T_MULTIPLY:
+            return True
+
+        elif self.type <= self.T_MOD:
+            return False
+
+        elif self.type <= self.T_POW:
+            return False
+
+        else:
+            assert False
+
 
 class UnaryOperator:
-    import ljd.config.version_config
-
     T_NOT = 60  # not operand
     T_LENGTH_OPERATOR = 61  # #operand
     T_MINUS = 62  # -operand
 
-    if ljd.config.version_config.use_version > 2.0:
-        T_TOSTRING = 63  # tostring()
-        T_TONUMBER = 64  # tonumber()
+    # Only available on bytecode revision 2 (LuaJIT 2.1)
+    # This used to be if'd off so accessing it would be
+    # an error, that is unfortunately no longer possible
+    # due to the switchable version system.
+    T_TOSTRING = 63  # tostring()
+    T_TONUMBER = 64  # tonumber()
 
     def __init__(self):
         self.type = -1
@@ -162,6 +249,9 @@ class UnaryOperator:
         visitor._visit(self.operand)
 
         visitor._leave_node(visitor.leave_unary_operator, self)
+
+    def precedence(self):
+        return BinaryOperator.PR_UNARY
 
 
 class StatementsList:
@@ -211,6 +301,9 @@ class VariablesList:
 
         visitor._leave_node(visitor.leave_variables_list, self)
 
+    def __str__(self):
+        return "VarList[" + ",".join([str(v) for v in self.contents]) + "]"
+
 
 class ExpressionsList:
     def __init__(self):
@@ -222,6 +315,9 @@ class ExpressionsList:
         visitor._visit_list(self.contents)
 
         visitor._leave_node(visitor.leave_expressions_list, self)
+
+    def __str__(self):
+        return "ExpList[" + ",".join([str(v) for v in self.contents]) + "]"
 
 
 # Called Name in the Lua 5.1 reference
@@ -235,16 +331,38 @@ class Identifier:
         self.name = None
         self.type = -1
         self.slot = -1
+        self.id = -1
         self._varinfo = None
 
     def _accept(self, visitor):
         visitor._visit_node(visitor.visit_identifier, self)
         visitor._leave_node(visitor.leave_identifier, self)
 
+    def _slot_name(self):
+        name = str(self.slot)
+        if self.id != -1:
+            name += ("#" + str(self.id))
+        else:
+            slot_ids = getattr(self, "_ids", None)
+            if slot_ids:
+                name += "#("
+                for i, slot_id in enumerate(slot_ids):
+                    if i > 0:
+                        name += "|"
+                    name += str(slot_id)
+                name += ")"
+        return name
+
     def __str__(self):
+        if self.type == Identifier.T_SLOT:
+            return "IdentSlot[%s:%s]" % (self._slot_name(), self.name)
+
+        if self.type == Identifier.T_BUILTIN:
+            return "IdentBuiltin[%s]" % self.name
+
         return "{ Identifier: {name: " + str(self.name) + ", type: " + ["T_SLOT", "T_LOCAL", "T_UPVALUE", "T_BUILTIN"][
             self.type] + \
-               ", slot: " + str(self.slot) + "} }"
+               ", slot: " + self._slot_name() + "} }"
 
 
 # helper vararg/varreturn
@@ -285,6 +403,7 @@ class FunctionCall:
     def __init__(self):
         self.function = None
         self.arguments = ExpressionsList()
+        self.is_method = False
 
     def _accept(self, visitor):
         visitor._visit_node(visitor.visit_function_call, self)
@@ -343,6 +462,7 @@ class Block:
         self.first_address = 0
         self.last_address = 0
         self.warpins_count = 0
+        self.loop = False
 
     def _accept(self, visitor):
         visitor._visit_node(visitor.visit_block, self)
@@ -356,7 +476,8 @@ class Block:
         return "{Block: {index: " + str(self.index) + ", warp: " + str(self.warp) + ", contents: " + \
                str(self.contents) + \
                ", first_address: " + str(self.first_address) + ", last_address: " + str(self.last_address) + \
-               ", warpins_count: " + str(self.warpins_count) + "}}"
+               ", warpins_count: " + str(self.warpins_count) + \
+               ", loop: " + str(self.loop) + "}}"
 
 
 class UnconditionalWarp:
@@ -376,9 +497,9 @@ class UnconditionalWarp:
         visitor._leave_node(visitor.leave_unconditional_warp, self)
 
     def __str__(self):
-        return "{UnconditionalWarp: {type: " + ["T_JUMP", "T_FLOW"][self.type] + ", target: " + str(
-            self.target) + ", is_uclo: " + \
-               str(self.is_uclo) + " }}"
+        return "{UnconditionalWarp: {type: " + ["T_JUMP", "T_FLOW"][self.type] \
+               + ", target: " + str("Block " + str(self.target.index) if self.target else None) \
+               + ", is_uclo: " + str(self.is_uclo) + " }}"
 
 
 class ConditionalWarp:
@@ -397,8 +518,10 @@ class ConditionalWarp:
         visitor._leave_node(visitor.leave_conditional_warp, self)
 
     def __str__(self):
-        return "{ConditionalWarp: { condition: " + str(self.condition) + ", true_target: " + str(self.true_target) + \
-               ", false_target: " + str(self.false_target) + "} }"
+        return "{ConditionalWarp: { condition: " + str(self.condition) \
+               + ", true_target: " + str("Block " + str(self.true_target.index) if self.true_target else None) \
+               + ", false_target: " + str("Block " + str(self.false_target.index) if self.false_target else None) \
+               + "} }"
 
 
 class IteratorWarp:
