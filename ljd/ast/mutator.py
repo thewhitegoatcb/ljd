@@ -43,7 +43,10 @@ class SimpleLoopWarpSwapper(traverse.Visitor):
             if use_break:
                 statement = nodes.Break()
             else:
-                statement = target.contents[0]
+                if not target.contents:
+                    continue
+                else:
+                    statement = target.contents[0]
                 target.contents = []
 
             block.contents.append(statement)
