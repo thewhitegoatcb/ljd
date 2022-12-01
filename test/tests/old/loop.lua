@@ -347,6 +347,12 @@ repeat
 	end
 until x < 3 and y < 3
 
+repeat
+	if qux then
+		break
+	end
+until qux
+
 --[[
 --]]
 
