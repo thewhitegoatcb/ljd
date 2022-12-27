@@ -611,12 +611,12 @@ class Visitor(traverse.Visitor):
             return
 
         for subnode in node.contents[:-1]:
-            self._visit(subnode)
+            self._visit(subnode, True)
 
             self._write(",")
             self._end_line()
 
-        self._visit(node.contents[-1])
+        self._visit(node.contents[-1], True)
         self._end_line()
 
     visit_variables_list = _visit_comma_separated_list
@@ -1004,17 +1004,15 @@ class Visitor(traverse.Visitor):
     def _skip(self, node):
         self._visited_nodes[-1].add(node)
 
-    def _visit(self, node):
+    def _visit(self, node, dont_return=False):
         assert node is not None
 
-        if node in self._visited_nodes[-1]:
-            # This is necessary now because expression list nils share the same address, and are therefore ignored.
-            # Presumably because of
-            # https://gitlab.com/znixian/luajit-decompiler/-/commit/a26be731ee690020f03220ad4c003fadc42b408c
-            # TODO: Find some way to fix this at slotworks.py
-            if not (isinstance(node, nodes.Primitive) and
-                    node.type == nodes.Primitive.T_NIL and self.print_queue[-1][1] == ', '):
-                return
+        # This is necessary now because expression list nils share the same address, and are therefore ignored.
+        # Presumably because of
+        # https://gitlab.com/znixian/luajit-decompiler/-/commit/a26be731ee690020f03220ad4c003fadc42b408c
+        # TODO: Find some way to fix this at slotworks.py
+        if node in self._visited_nodes[-1] and not dont_return:
+            return
 
         self._visited_nodes[-1].add(node)
 
