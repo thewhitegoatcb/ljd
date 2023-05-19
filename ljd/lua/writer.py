@@ -863,7 +863,9 @@ class Visitor(traverse.Visitor):
 
     def visit_return(self, node):
         self._start_statement(STATEMENT_RETURN)
-
+        if node.mid_block:
+             self._write("do ")
+        
         if len(node.returns.contents) > 0:
             self._write("return ")
         else:
@@ -871,6 +873,8 @@ class Visitor(traverse.Visitor):
 
         self._visit(node.returns)
 
+        if node.mid_block:
+             self._write(" end")
         self._end_statement(STATEMENT_RETURN)
 
     def visit_break(self, node):

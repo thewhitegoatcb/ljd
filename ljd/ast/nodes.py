@@ -575,6 +575,7 @@ class EndWarp:
 class Return:
     def __init__(self):
         self.returns = ExpressionsList()
+        self.mid_block = None
 
     def _accept(self, visitor):
         visitor._visit_node(visitor.visit_return, self)

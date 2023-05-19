@@ -679,6 +679,8 @@ def _build_return(state, addr, instruction):
 
     base = instruction.A
     last_slot = base + instruction.CD - 1
+    
+    node.mid_block = addr != state.block.last_address
 
     if instruction.opcode != ins.RETM.opcode:
         last_slot -= 1
