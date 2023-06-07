@@ -35,6 +35,9 @@ def _build_function_definition(prototype, header):
 
     state = _State()
 
+    setattr(node, "_first_line", prototype.first_line_number)
+    setattr(node, "_last_line", prototype.first_line_number + prototype.lines_count)
+
     state.constants = prototype.constants
     state.debuginfo = prototype.debuginfo
     state.header = header
@@ -185,12 +188,18 @@ def _blockenize(state, instructions):
         block.first_address = previous_last_address + 1
         block.last_address = last_address
 
+        setattr(block, "_first_line", state.debuginfo.lookup_line_number(block.first_address))
+        setattr(block, "_last_line", state.debuginfo.lookup_line_number(block.last_address))
+
         state.blocks.append(block)
         state.block_starts[block.first_address] = block
 
         previous_last_address = last_address
 
         index += 1
+    
+    state.blocks[-1]._first_line += 1
+    state.blocks[-1]._last_line += 1
 
 
 def _establish_warps(state, instructions):

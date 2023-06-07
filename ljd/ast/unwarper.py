@@ -1027,6 +1027,7 @@ def _unwarp_logical_expression(start, end, body):
     dst = copy.deepcopy(slot)
 
     assignment = nodes.Assignment()
+    setattr(assignment, "_line", start._last_line) ####
     assignment.destinations.contents.append(dst)
     assignment.expressions.contents.append(expression)
 
@@ -1669,6 +1670,8 @@ def _unwarp_if_statement(start, body, end, topmost_end):
                                                      topmost_end)
 
     node = nodes.If()
+    setattr(node, "_first_line", start._last_line) ####
+    #setattr(node, "_last_line", end._last_line) ####
     node.expression = expression
 
     # has an else branch
@@ -1974,6 +1977,8 @@ def _handle_single_loop(start, end, blocks, repeat_until):
 
 def _loop_build_block(start, body, end, blocks, loop, block_index):
     block = nodes.Block()
+    setattr(block, "_first_line", body[0]._first_line) ####
+    #setattr(block, "_last_line", body[0]._last_line)
     block.first_address = body[0].first_address
     block.last_address = body[-1].last_address
     block.index = block_index
@@ -2112,6 +2117,8 @@ def _unwarp_loop(start, end, body, expr_body=None):
         loop.identifiers = start.warp.variables
         loop.expressions = start.warp.controls
         loop._addr = body[0].first_address
+        #setattr(loop, "_first_line", loop.expressions.contents[0]._line) ###
+        setattr(loop, "_last_line", start._last_line) ###
 
         _set_flow_to(start, body[0])
 
@@ -2124,6 +2131,9 @@ def _unwarp_loop(start, end, body, expr_body=None):
         loop.variable = start.warp.index
         loop.expressions = start.warp.controls
         loop._addr = body[0].first_address
+        #setattr(loop, "_first_line", loop.expressions.contents[0]._line) ###
+        setattr(loop, "_last_line", start._last_line) ###
+
         _set_flow_to(start, body[0])
 
     # While (including "while true" and "repeat until false")
@@ -2144,6 +2154,8 @@ def _unwarp_loop(start, end, body, expr_body=None):
                 body.pop()  # Remove the jump block specific to this case
             else:
                 loop = nodes.While()
+                setattr(loop, "_first_line", start._first_line) ###
+                setattr(loop, "_last_line", start._last_line)
                 loop.expression = nodes.Primitive()
                 loop.expression.type = nodes.Primitive.T_TRUE
 
@@ -2181,6 +2193,8 @@ def _unwarp_loop(start, end, body, expr_body=None):
             loop = nodes.While()
             loop.expression = expression
             loop.statements.contents = body
+            setattr(loop, "_first_line", start._first_line) ###
+            setattr(loop, "_last_line", loop.statements.contents[0]._last_line) ###
 
         _fix_nested_ifs(body, start)
 
@@ -2218,7 +2232,10 @@ def _unwarp_loop(start, end, body, expr_body=None):
             expression.pop(0)
             if len(body[-1].contents) == 1 and isinstance(body[-1].contents, nodes.NoOp):
                 body[-1].contents = []
-            body[-1].contents.append(nodes.Break())
+            #### body[-1].contents.append(nodes.Break())
+            break_node = nodes.Break()
+            setattr(break_node, "_line", start._first_line)
+            body[-1].contents.append(break_node)
 
         false = body[0]
         # Don't use end as it could be broken by a previous
@@ -2226,6 +2243,7 @@ def _unwarp_loop(start, end, body, expr_body=None):
         true = expression[-1].warp.true_target
 
         loop = nodes.RepeatUntil()
+        setattr(loop, "_first_line", start._first_line) ####
         loop.expression = _compile_expression(expression, None,
                                               true, false)
 
@@ -2248,6 +2266,8 @@ def _unwarp_loop(start, end, body, expr_body=None):
 
 def _create_next_block(original):
     block = nodes.Block()
+    setattr(block, "_first_line", original._first_line) ###
+    setattr(block, "_last_line", original._last_line) ###
     block.first_address = original.last_address + 1
     block.last_address = block.first_address
     block.index = original.index + 1
@@ -2394,13 +2414,17 @@ def _unwarp_breaks(start, blocks, next_block):
             patched.append(block)
             patched.append(new_block)
 
+            old_block = block ###
             block = new_block
         else:
             patched.append(block)
 
         if len(block.contents) == 1 and isinstance(block.contents[0], nodes.NoOp):
             block.contents = []
-        block.contents.append(nodes.Break())
+        #### block.contents.append(nodes.Break())
+        break_node = nodes.Break() ### 
+        setattr(break_node, "_line", block._last_line) ###
+        block.contents.append(break_node) ###
 
         if i + 1 == len(blocks):
             _set_end(block)

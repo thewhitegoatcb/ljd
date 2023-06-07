@@ -24,6 +24,7 @@ CMD_END_LINE = 3
 CMD_START_BLOCK = 4
 CMD_END_BLOCK = 5
 CMD_WRITE = 6
+CMD_WRITE_FLOATING = 7
 
 OPERATOR_TYPES = (nodes.BinaryOperator, nodes.UnaryOperator)
 
@@ -83,11 +84,51 @@ class _State:
         self.function_method = False
 
 
+class LineInfoFiller(traverse.Visitor):
+    def __init__(self):
+        traverse.Visitor.__init__(self)
+        self.min_max_stack = []
+
+    def _visit_node(self, handler, node):
+        self.min_max_stack.append([None, None])
+
+    def _leave_node(self, handler, node):
+        min_line, max_line = self.min_max_stack.pop()
+
+        line = node._line if hasattr(node, "_line") else None
+        first_line = node._first_line if hasattr(node, "_first_line") else None
+        last_line = node._last_line if hasattr(node, "_last_line") else None
+
+        min_max_range = (min_line, max_line, line, first_line, last_line)
+        min_max_range = [i for i in min_max_range if i is not None]
+
+        if min_max_range:
+            min_line = min(min_max_range)
+            max_line = max(min_max_range)
+
+            if line is None and min_line is not None:
+                setattr(node, "_line", min_line)
+            if first_line is None and min_line is not None:
+                setattr(node, "_first_line", min_line)
+            if last_line is None and max_line is not None:
+                setattr(node, "_last_line", max_line)
+            
+            # update min/max parent node
+            if self.min_max_stack:
+                self.min_max_stack[-1][0] = min(min_line, self.min_max_stack[-1][0]) if self.min_max_stack[-1][0] else min_line
+                self.min_max_stack[-1][1] = max(max_line, self.min_max_stack[-1][1]) if self.min_max_stack[-1][1] else max_line
+            
+    def fill(self, node):
+        traverse.traverse(self, node)
+    
 class Visitor(traverse.Visitor):
     def __init__(self):
         traverse.Visitor.__init__(self)
 
         self.print_queue = []
+
+        self._disable_line_setting = []
+        self._current_line = 1
 
         self._path = []
         self._visited_nodes = [set()]
@@ -97,27 +138,74 @@ class Visitor(traverse.Visitor):
 
     # ##
 
-    def _start_statement(self, statement):
+    def _get_line(self, passed_line):
+        return self._current_line if passed_line == 0 else passed_line
+    
+    def _start_statement(self, statement, node, line = 0):
+        if line != 0:
+            self._advance_to_line(line)
+            line = 0
+        elif hasattr(node, "_first_line"):
+            self._advance_to_line(node._first_line)
+    
         assert self._state().current_statement == STATEMENT_NONE
         self._state().current_statement = statement
-        self.print_queue.append((CMD_START_STATEMENT, statement))
+        self.print_queue.append((CMD_START_STATEMENT, self._get_line(line), statement))
 
-    def _end_statement(self, statement):
+    def _end_statement(self, statement, node = None, line = 0):
+        if node and hasattr(node, "_last_line"):
+            self._advance_to_line(node._last_line)
+    
         assert statement == self._state().current_statement
         self._state().current_statement = STATEMENT_NONE
-        self.print_queue.append((CMD_END_STATEMENT, statement))
+        self.print_queue.append((CMD_END_STATEMENT, self._get_line(line), statement))
 
-    def _end_line(self):
-        self.print_queue.append((CMD_END_LINE,))
+    def _end_statement_with(self, statement, end_with, node = None, line = 0):
+        if node and hasattr(node, "_last_line"):
+            self._advance_to_line(node._last_line)
+    
+        assert statement == self._state().current_statement
+        self._state().current_statement = STATEMENT_NONE
+        self.print_queue.append((CMD_WRITE_FLOATING, self._get_line(line), end_with, statement))
+
+    def _end_line(self, line = 0):
+        pass
+        
+
+    def _advance_to_line(self, line):
+        if self._disable_line_setting:
+            return
+        
+        #assert line >= self._current_line
+
+        if line < self._current_line:
+            print(f"Writer: Line mismatch at line:{self._current_line}, should be at {line}")
+
+        self._current_line = line
+            
+    def _advance_to_node_line(self, node):
+        if hasattr(node, "_line"):
+            self._advance_to_line(node._line)
+        elif hasattr(node, "_first_line"):
+            self._advance_to_line(node._first_line)
+
+    def _disable_line_info(self):
+        self._disable_line_setting.append(True)
+    
+    def _enable_line_info(self):
+        self._disable_line_setting.pop()
 
     def _start_block(self):
-        self.print_queue.append((CMD_START_BLOCK,))
+        self.print_queue.append((CMD_START_BLOCK, self._current_line))
 
     def _end_block(self):
-        self.print_queue.append((CMD_END_BLOCK,))
+        self.print_queue.append((CMD_END_BLOCK, self._current_line))
 
     def _write(self, fmt, *args, **kargs):
-        self.print_queue.append((CMD_WRITE, fmt, args, kargs))
+        self.print_queue.append((CMD_WRITE, self._current_line, fmt, args, kargs))
+
+    def _write_floating(self, str, line = 0):
+        self.print_queue.append((CMD_WRITE_FLOATING, self._get_line(line), str))
 
     def _state(self):
         return self._states[-1]
@@ -171,31 +259,31 @@ class Visitor(traverse.Visitor):
         is_method = self._state().function_method
 
         if is_statement:
-            self._start_statement(STATEMENT_FUNCTION)
+            self._start_statement(STATEMENT_FUNCTION, node)
 
             lineinfo = show_line_info and getattr(node, "_lineinfo", None)
             if lineinfo:
-                self._write("-- Lines {0}-{1}".format(lineinfo[0], lineinfo[0] + lineinfo[1]))
+                self._write("--[[ Lines {0}-{1} --]]".format(lineinfo[0], lineinfo[0] + lineinfo[1]))
                 self._end_line()
 
             if self._state().function_local:
-                self._write("local ")
+                self._write("local")
 
-            self._write("function ")
+            self._write("function")
 
             fn = self._state().function_name
             if is_method and not write_function_definition_self_arg:
                 self._visit(fn.table)
-                self._write(":")
+                self._write("\0:\0")
                 self._write(fn.key)
             else:
                 self._visit(fn)
 
-            self._write("(")
+            self._write("\0(\0")
 
             self._state().function_name = None
         else:
-            self._write("function (")
+            self._write("function (\0")
 
         args = node.arguments
 
@@ -219,7 +307,7 @@ class Visitor(traverse.Visitor):
 
         self._visit(args)
 
-        self._write(")")
+        self._write("\0)")
 
         self._end_line()
 
@@ -230,11 +318,11 @@ class Visitor(traverse.Visitor):
             self._start_block()
             self._write('error("Decompilation failed")')
             self._end_line()
-            self._write("-- Exception in function building!")
+            self._write("--[[ Exception in function building! --]]")
             self._end_line()
             for entry in traceback.format_exception(value=node.error, tb=node.error.__traceback__, etype=None):
                 for line in entry.strip().split("\n"):
-                    self._write("-- " + line)
+                    self._write("--[[ " + line + " --]]")
                     self._end_line()
             self._end_block()
 
@@ -245,7 +333,7 @@ class Visitor(traverse.Visitor):
                 node.statements.contents.pop(-1)
 
         self._visit(node.statements)
-
+        self._advance_to_line(node._last_line)
         self._write("end")
 
         if is_statement:
@@ -298,13 +386,13 @@ class Visitor(traverse.Visitor):
 
             self._skip(node.key)
 
-            self._write(" = ")
+            self._write("=")
         else:
-            self._write("[")
+            self._write("[\0")
 
             self._visit(node.key)
 
-            self._write("] = ")
+            self._write("\0] =")
 
         self._visit(node.value)
 
@@ -313,6 +401,11 @@ class Visitor(traverse.Visitor):
     # ##
 
     def visit_assignment(self, node):
+        # if hasattr(node.expressions.contents[0], "_line"):
+        #     self._advance_to_node_line(node.expressions.contents[0])
+        # else:
+        #     self._advance_to_node_line(node)
+
         is_local = node.type == node.T_LOCAL_DEFINITION
 
         dsts = node.destinations.contents
@@ -345,17 +438,18 @@ class Visitor(traverse.Visitor):
 
                     return
 
-        if is_local:
-            self._write("local ")
 
         if src_is_function:
-            self._start_statement(STATEMENT_FUNCTION)
+            self._start_statement(STATEMENT_FUNCTION, node)
         else:
-            self._start_statement(STATEMENT_ASSIGNMENT)
+            self._start_statement(STATEMENT_ASSIGNMENT, node)
+
+        if is_local: ###
+            self._write("local") ###
 
         self._visit(node.destinations)
 
-        self._write(" = ")
+        self._write("=")
 
         self._visit(node.expressions)
 
@@ -483,6 +577,17 @@ class Visitor(traverse.Visitor):
 
                 elif node.type == binop.T_MULTIPLY and binop.T_MULTIPLY <= node.right.type <= binop.T_DIVISION:
                     right_parentheses = False
+        
+        left_line = node.left._line if hasattr(node.left, "_line") else 0
+        right_line = node.right._line if hasattr(node.right, "_line") else 0
+        
+        # compiler/decompiler can invert statments for efficiency
+        inverted = False
+        if left_line != 0 and right_line != 0:
+            inverted = node.right._line < node.left._line
+
+        if inverted:
+            self._disable_line_info()
 
         if left_parentheses:
             self._write("(")
@@ -493,81 +598,84 @@ class Visitor(traverse.Visitor):
             self._write(")")
 
         if node.type == nodes.BinaryOperator.T_LOGICAL_OR:
-            self._write(" or ")
+            self._write("or")
         elif node.type == nodes.BinaryOperator.T_LOGICAL_AND:
-            self._write(" and ")
+            self._write("and")
 
         elif node.type == nodes.BinaryOperator.T_LESS_THEN:
-            self._write(" < ")
+            self._write("<")
         elif node.type == nodes.BinaryOperator.T_GREATER_THEN:
-            self._write(" > ")
+            self._write(">")
         elif node.type == nodes.BinaryOperator.T_LESS_OR_EQUAL:
-            self._write(" <= ")
+            self._write("<=")
         elif node.type == nodes.BinaryOperator.T_GREATER_OR_EQUAL:
-            self._write(" >= ")
+            self._write(">=")
 
         elif node.type == nodes.BinaryOperator.T_NOT_EQUAL:
-            self._write(" ~= ")
+            self._write("~=")
         elif node.type == nodes.BinaryOperator.T_EQUAL:
-            self._write(" == ")
+            self._write("==")
 
         elif node.type == nodes.BinaryOperator.T_CONCAT:
-            self._write(" .. ")
+            self._write("..")
 
         elif node.type == nodes.BinaryOperator.T_ADD:
-            self._write(" + ")
+            self._write("+")
         elif node.type == nodes.BinaryOperator.T_SUBTRACT:
-            self._write(" - ")
+            self._write("-")
 
         elif node.type == nodes.BinaryOperator.T_DIVISION:
-            self._write(" / ")
+            self._write("/")
         elif node.type == nodes.BinaryOperator.T_MULTIPLY:
-            self._write(" * ")
+            self._write("*")
         elif node.type == nodes.BinaryOperator.T_MOD:
-            self._write(" % ")
+            self._write("%")
 
         else:
             assert node.type == nodes.BinaryOperator.T_POW
             self._write("^")
 
         if right_parentheses:
-            self._write("(")
+            self._write("(\0")
 
         self._visit(node.right)
 
         if right_parentheses:
-            self._write(")")
+            self._write("\0)")
 
+        if inverted:
+            self._enable_line_info()
+            
     def visit_unary_operator(self, node):
         if node.type == nodes.UnaryOperator.T_LENGTH_OPERATOR:
-            self._write("#")
+            self._write("#\0")
         elif node.type == nodes.UnaryOperator.T_MINUS:
-            self._write("-")
+            self._write("-\0")
         elif node.type == nodes.UnaryOperator.T_NOT:
             if hasattr(node.operand, "slot"):
                 if not node.operand.slot == SLOT_FALSE:
-                    self._write("not ")
+                    self._write("not")
                 else:
                     node.operand.slot = SLOT_TRUE
             else:
-                self._write("not ")
+                self._write("not")
         elif ljd.CURRENT_VERSION > 2.0:
             # TODO
             if node.type == nodes.UnaryOperator.T_TOSTRING:
-                self._write("tostring")
+                self._write("tostring\0")
             elif node.type == nodes.UnaryOperator.T_TONUMBER:
-                self._write("tonumber")
+                self._write("tonumber\0")
 
         has_subexp = isinstance(node.operand, OPERATOR_TYPES)
         need_parentheses = has_subexp and node.operand.type < node.type
 
         if need_parentheses:
-            self._write("(")
+            self._write("(\0")
 
         self._visit(node.operand)
 
         if need_parentheses:
-            self._write(")")
+            self._write("\0)")
 
     # ##
 
@@ -585,7 +693,7 @@ class Visitor(traverse.Visitor):
                 add_comment = isinstance(node.contents[0], nodes.NoOp)
 
             if add_comment:
-                self._write("-- Nothing")
+                self._write("--[[ Nothing --]]")
                 self._end_line()
 
     def leave_statements_list(self, node):
@@ -600,7 +708,7 @@ class Visitor(traverse.Visitor):
 
         for subnode in node.contents[:-1]:
             self._visit(subnode)
-            self._write(", ")
+            self._write("\0,")
 
         self._visit(node.contents[-1])
 
@@ -613,7 +721,7 @@ class Visitor(traverse.Visitor):
         for subnode in node.contents[:-1]:
             self._visit(subnode)
 
-            self._write(",")
+            self._write("\0,")
             self._end_line()
 
         self._visit(node.contents[-1])
@@ -670,13 +778,13 @@ class Visitor(traverse.Visitor):
             self._write(")")
 
         if is_valid_name:
-            self._write(".")
+            self._write("\0.\0")
             self._write(key.value)
             self._skip(key)
         else:
-            self._write("[")
+            self._write("[\0")
             self._visit(key)
-            self._write("]")
+            self._write("\0]")
 
     def visit_vararg(self, node):
         self._write("...")
@@ -685,7 +793,7 @@ class Visitor(traverse.Visitor):
         is_statement = self._state().current_statement == STATEMENT_NONE
 
         if is_statement:
-            self._start_statement(STATEMENT_FUNCTION_CALL)
+            self._start_statement(STATEMENT_FUNCTION_CALL, node)
 
         # We are going to modify this list so we can remove the first argument
         args = node.arguments.contents
@@ -698,14 +806,14 @@ class Visitor(traverse.Visitor):
                                   or (isinstance(base, nodes.Constant) and base.type == nodes.Constant.T_STRING)
 
             if base_is_constructor:
-                self._write("(")
+                self._write("\0(\0")
 
             self._visit(base)
 
             if base_is_constructor:
-                self._write(")")
+                self._write("\0)")
 
-            self._write(":")
+            self._write("\0:\0")
 
             assert self._is_valid_name(func.key)
 
@@ -714,17 +822,17 @@ class Visitor(traverse.Visitor):
 
             self._skip(node.function)
 
-            self._write("(")
+            self._write("\0(\0")
             self._visit(node.arguments)
-            self._write(")")
+            self._write("\0)")
 
             self._skip(node.arguments)
         else:
             self._visit(node.function)
 
-            self._write("(")
+            self._write("\0(\0")
             self._visit(node.arguments)
-            self._write(")")
+            self._write("\0)")
 
         if is_statement:
             self._end_statement(STATEMENT_FUNCTION_CALL)
@@ -732,13 +840,13 @@ class Visitor(traverse.Visitor):
     # ##
 
     def visit_if(self, node):
-        self._start_statement(STATEMENT_IF)
+        self._start_statement(STATEMENT_IF, node)
 
-        self._write("if ")
+        self._write("if")
 
         self._visit(node.expression)
 
-        self._write(" then")
+        self._write("then")
 
         self._end_line()
 
@@ -747,7 +855,7 @@ class Visitor(traverse.Visitor):
         self._visit_list(node.elseifs)
 
         if len(node.else_block.contents) > 0:
-            self._write("else")
+            self._write_floating("else")
 
             self._end_line()
 
@@ -755,16 +863,19 @@ class Visitor(traverse.Visitor):
         else:
             self._skip(node.else_block)
 
-        self._write("end")
+        #self._advance_to_line(node._last_line)
+        #self._write("end")
 
-        self._end_statement(STATEMENT_IF)
+        self._end_statement_with(STATEMENT_IF, "end")
 
     def visit_elseif(self, node):
-        self._write("elseif ")
+        self._advance_to_line(node._first_line) ###
+
+        self._write("elseif")
 
         self._visit(node.expression)
 
-        self._write(" then")
+        self._write("then")
 
         self._end_line()
 
@@ -773,7 +884,7 @@ class Visitor(traverse.Visitor):
     # ##
 
     def visit_block(self, node):
-        self._write("--- BLOCK #{0} {1}-{2}, warpins: {3} ---",
+        self._write("--[[ BLOCK #{0} {1}-{2}, warpins: {3} --]]",
                     node.index,
                     node.first_address, node.last_address,
                     node.warpins_count)
@@ -782,7 +893,7 @@ class Visitor(traverse.Visitor):
 
         self._visit_list(node.contents)
 
-        self._write("--- END OF BLOCK #{0} ---", node.index)
+        self._write("--[[ END OF BLOCK #{0} --]]", node.index)
 
         self._end_line()
 
@@ -794,33 +905,33 @@ class Visitor(traverse.Visitor):
 
     def visit_unconditional_warp(self, node):
         if node.type == nodes.UnconditionalWarp.T_FLOW:
-            self._write("FLOW")
+            self._write("--[[ FLOW --]]")
         elif node.type == nodes.UnconditionalWarp.T_JUMP:
-            self._write("UNCONDITIONAL JUMP")
+            self._write("--[[ UNCONDITIONAL JUMP --]]")
 
-        self._write("; TARGET BLOCK #{0}", node.target.index)
+        self._write("--[[ TARGET BLOCK #{0}; --]]", node.target.index)
 
         self._end_line()
 
     def visit_conditional_warp(self, node):
         if hasattr(node, "_slot"):
             self._write_slot(node)
-            self._write(" = ")
+            self._write("=")
 
-        self._write("if ")
+        self._write("if")
 
         self._visit(node.condition)
 
-        self._write(" then")
+        self._write("then")
         self._end_line()
 
-        self._write("JUMP TO BLOCK #{0}", node.true_target.index)
+        self._write("", node.true_target.index)
 
         self._end_line()
         self._write("else")
         self._end_line()
 
-        self._write("JUMP TO BLOCK #{0}", node.false_target.index)
+        self._write("--[[ JUMP TO BLOCK #{0} --]]", node.false_target.index)
 
         self._end_line()
 
@@ -828,24 +939,24 @@ class Visitor(traverse.Visitor):
         self._end_line()
 
     def visit_iterator_warp(self, node):
-        self._write("for ")
+        self._write("for")
 
         self._visit(node.variables)
 
-        self._write(" in ")
+        self._write("in")
 
         self._visit(node.controls)
 
         self._end_line()
-        self._write("LOOP BLOCK #{0}", node.body.index)
+        self._write("--[[ LOOP BLOCK #{0} --]]", node.body.index)
 
         self._end_line()
-        self._write("GO OUT TO BLOCK #{0}", node.way_out.index)
+        self._write("--[[ GO OUT TO BLOCK #{0} --]]", node.way_out.index)
 
         self._end_line()
 
     def visit_numeric_loop_warp(self, node):
-        self._write("for ")
+        self._write("for")
 
         self._visit(node.index)
 
@@ -854,31 +965,28 @@ class Visitor(traverse.Visitor):
         self._visit(node.controls)
 
         self._end_line()
-        self._write("LOOP BLOCK #{0}", node.body.index)
+        self._write("--[[ LOOP BLOCK #{0} --]]", node.body.index)
 
         self._end_line()
-        self._write("GO OUT TO BLOCK #{0}", node.way_out.index)
+        self._write("--[[ GO OUT TO BLOCK #{0} --]]", node.way_out.index)
 
     # ##
 
     def visit_return(self, node):
-        self._start_statement(STATEMENT_RETURN)
+        self._start_statement(STATEMENT_RETURN, node)
         if node.mid_block:
-             self._write("do ")
+             self._write("do")
         
-        if len(node.returns.contents) > 0:
-            self._write("return ")
-        else:
-            self._write("return")
+        self._write("return")
 
         self._visit(node.returns)
 
         if node.mid_block:
-             self._write(" end")
+             self._write("end")
         self._end_statement(STATEMENT_RETURN)
 
     def visit_break(self, node):
-        self._start_statement(STATEMENT_BREAK)
+        self._start_statement(STATEMENT_BREAK, node)
 
         self._write("break")
 
@@ -887,38 +995,39 @@ class Visitor(traverse.Visitor):
     # ##
 
     def visit_while(self, node):
-        self._start_statement(STATEMENT_WHILE)
+        self._start_statement(STATEMENT_WHILE, node)
 
-        self._write("while ")
+        self._write("while")
         self._visit(node.expression)
-        self._write(" do")
+        
+        self._advance_to_line(node._last_line)
+        self._write("do")
 
         self._end_line()
 
         self._visit(node.statements)
 
-        self._write("end")
-        self._end_statement(STATEMENT_WHILE)
+        self._end_statement_with(STATEMENT_WHILE, "end")
 
     def visit_repeat_until(self, node):
-        self._start_statement(STATEMENT_REPEAT_UNTIL)
+        self._start_statement(STATEMENT_REPEAT_UNTIL, node)
 
         self._write("repeat")
         self._end_line()
 
         self._visit(node.statements)
 
-        self._write("until ")
+        self._write("until")
         self._visit(node.expression)
 
         self._end_statement(STATEMENT_REPEAT_UNTIL)
 
     def visit_numeric_for(self, node):
-        self._start_statement(STATEMENT_NUMERIC_FOR)
+        self._start_statement(STATEMENT_NUMERIC_FOR, node)
 
-        self._write("for ")
+        self._write("for")
         self._visit(node.variable)
-        self._write(" = ")
+        self._write("=")
 
         # Manually visit the expressions so we have the option to skip the default increment
         self._skip(node.expressions)
@@ -930,34 +1039,35 @@ class Visitor(traverse.Visitor):
 
         for subnode in expressions[:-1]:
             self._visit(subnode)
-            self._write(", ")
+            self._write("\0,")
 
         self._visit(expressions[-1])
 
-        self._write(" do")
+        self._advance_to_line(node._last_line)
+        self._write("do")
 
         self._end_line()
 
         self._visit(node.statements)
 
-        self._write("end")
-        self._end_statement(STATEMENT_NUMERIC_FOR)
+        self._end_statement_with(STATEMENT_NUMERIC_FOR, "end")
 
     def visit_iterator_for(self, node):
-        self._start_statement(STATEMENT_ITERATOR_FOR)
+        self._start_statement(STATEMENT_ITERATOR_FOR, node)
 
-        self._write("for ")
+        self._write("for")
         self._visit(node.identifiers)
-        self._write(" in ")
+        self._write("in")
         self._visit(node.expressions)
-        self._write(" do")
+        
+        self._advance_to_line(node._last_line)
+        self._write("do")
 
         self._end_line()
 
         self._visit(node.statements)
 
-        self._write("end")
-        self._end_statement(STATEMENT_ITERATOR_FOR)
+        self._end_statement_with(STATEMENT_ITERATOR_FOR, "end")
 
     # ##
 
@@ -966,26 +1076,28 @@ class Visitor(traverse.Visitor):
             self._write(node.value)
             return
 
-        lines = node.value.count("\n")
+        # TODO: support multline if there's space
+        # lines = node.value.count("\n")
 
-        if lines > 2:
-            self._write("[[")
+        # if lines > 2:
+        #     self._write("[[\0")
 
-            self._write("\n")
+        #     self._advance_to_line(self._current_line + 1)
+        #     self._write("\n\0")
 
-            self._write(node.value)
+        #     self._write(node.value)
 
-            self._write("]]")
-        else:
-            text = node.value
+        #     self._write("\0]]")
+        # else:
+        text = node.value
 
-            text = text.replace("\\", "\\\\")
-            text = text.replace("\t", "\\t")
-            text = text.replace("\n", "\\n")
-            text = text.replace("\r", "\\r")
-            text = text.replace("\"", "\\\"")
+        text = text.replace("\\", "\\\\")
+        text = text.replace("\t", "\\t")
+        text = text.replace("\n", "\\n")
+        text = text.replace("\r", "\\r")
+        text = text.replace("\"", "\\\"")
 
-            self._write('"' + text + '"')
+        self._write('"' + text + '"')
 
     def visit_primitive(self, node):
         if node.type == nodes.Primitive.T_FALSE:
@@ -1017,7 +1129,7 @@ class Visitor(traverse.Visitor):
             # https://gitlab.com/znixian/luajit-decompiler/-/commit/a26be731ee690020f03220ad4c003fadc42b408c
             # TODO: Find some way to fix this at slotworks.py
             if not (isinstance(node, nodes.Primitive) and
-                    node.type == nodes.Primitive.T_NIL and self.print_queue[-1][1] == ', '):
+                    node.type == nodes.Primitive.T_NIL and self.print_queue[-1][2] == '\0,'):
                 return
 
         self._visited_nodes[-1].add(node)
@@ -1029,13 +1141,17 @@ class Visitor(traverse.Visitor):
 
         if hasattr(node, "_decompilation_error_here"):
             self._end_line()
-            self._write("-- Decompilation error in this vicinity:")
+            self._write(" --[[ Decompilation error in this vicinity: --]] ")
             self._end_line()
 
         if hasattr(node, "_line") and node._line:
             line = node._line
             self.line_token_map[line] = len(self.print_queue)
+            if hasattr(node, "_first_line"):
+                line = node._line = node._first_line
 
+            self._advance_to_line(line)
+            
         traverse.Visitor._visit(self, node)
 
         self._visited_nodes.pop()
@@ -1043,6 +1159,9 @@ class Visitor(traverse.Visitor):
 
 def write(fd, ast, generate_linemap=False):
     assert isinstance(ast, nodes.FunctionDefinition)
+
+    filler = LineInfoFiller()
+    filler.fill(ast.statements)
 
     visitor = Visitor()
 
@@ -1071,14 +1190,31 @@ def wrapped_write(fd, *objects, sep=' ', end='\n', file=sys.stdout):
     #     f = lambda obj: str(obj).encode(enc, errors='backslashreplace').decode(enc)
     #     fd.write(*map(f, objects))
 
+def write_to_line(line, text):
+    #if len(line) == 1 and line[0] in NO_LEFT_SPACE_CHAR:
+    no_space = len(line) == 0
+    if line.endswith('\0'):
+        line = line[:-1]
+        no_space = True
+    if text.startswith('\0'):
+        text = text[1:]
+        no_space = True
+    
+    if no_space:
+        return line + text
+    return line + ' ' + text
 
-def _get_next_significant(queue, i):
+def write_line(fd, line):
+    fd.write(line.replace('\0', ''))
+    return ""
+
+def _get_next_statement(queue, i):
     i += 1
 
     while i < len(queue):
         cmd = queue[i]
 
-        if cmd[0] not in (CMD_END_LINE, CMD_WRITE):
+        if cmd[0] == CMD_WRITE:
             break
 
         i += 1
@@ -1086,9 +1222,8 @@ def _get_next_significant(queue, i):
     if i < len(queue):
         return queue[i]
     else:
-        return CMD_END_BLOCK,
-
-
+        return CMD_END_BLOCK, 0
+        
 def _process_queue(fd, queue, wanted_tokens):
     indent = 0
 
@@ -1096,33 +1231,31 @@ def _process_queue(fd, queue, wanted_tokens):
 
     token_map = {}
     line_num = 1
+    output_lines = {}
+    line_text = ""
 
     for i, cmd in enumerate(queue):
         assert isinstance(cmd, tuple)
 
-        if wanted_tokens and i in wanted_tokens:
-            token_map[i] = line_num
+        delta_lines = cmd[1] - line_num
+
+        if 0 < delta_lines:
+            if line_text:
+                line_text = write_line(fd, line_text)
+            wrapped_write(fd, "\n" * delta_lines)
+            line_broken = True
+        
+        line_num = max(cmd[1], line_num)
 
         if cmd[0] == CMD_START_STATEMENT:
             # assert line_broken
             pass
         elif cmd[0] == CMD_END_STATEMENT:
-            wrapped_write(fd, "\n")
-            line_num += 1
-            line_broken = True
+            pass
+            #wrapped_write(fd, " ")
 
-            next_cmd = _get_next_significant(queue, i)
-
-            if next_cmd[0] not in (CMD_END_BLOCK, CMD_START_BLOCK):
-                assert next_cmd[0] == CMD_START_STATEMENT
-
-                if next_cmd[1] != cmd[1] \
-                        or cmd[1] >= STATEMENT_IF \
-                        or next_cmd[1] >= STATEMENT_IF:
-                    wrapped_write(fd, "\n")
-                    line_num += 1
         elif cmd[0] == CMD_END_LINE:
-            wrapped_write(fd, "\n")
+            line_text = write_line(fd, line_text)
             line_num += 1
             line_broken = True
         elif cmd[0] == CMD_START_BLOCK:
@@ -1131,6 +1264,16 @@ def _process_queue(fd, queue, wanted_tokens):
             indent -= 1
 
             assert indent >= 0
+        elif cmd[0] == CMD_WRITE_FLOATING:
+            # Check if there's space on next line
+            if line_num + 1 < _get_next_statement(queue, i)[1]:
+                line_text = write_line(fd, line_text)
+                wrapped_write(fd, "\n" + indent * "\t")
+                line_text = write_to_line(line_text, cmd[2])
+                line_num += 1
+                line_broken = False
+            else:
+                line_text = write_to_line(line_text, cmd[2])
         else:
             assert cmd[0] == CMD_WRITE
 
@@ -1138,7 +1281,7 @@ def _process_queue(fd, queue, wanted_tokens):
                 wrapped_write(fd, indent * '\t')
                 line_broken = False
 
-            _id, fmt, args, kargs = cmd
+            _id, _line, fmt, args, kargs = cmd
 
             if len(args) + len(kargs) > 0:
                 text = fmt.format(*args, **kargs)
@@ -1147,6 +1290,6 @@ def _process_queue(fd, queue, wanted_tokens):
             else:
                 text = str(fmt)
 
-            wrapped_write(fd, text)
-
+            line_text = write_to_line(line_text, text)
+    write_line(fd, line_text)
     return token_map
