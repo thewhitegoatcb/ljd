@@ -21,6 +21,11 @@ class BinStream:
         self.name = filename
         self.fd = io.open(filename, 'rb')
         self.size = os.stat(filename).st_size
+    
+    def open_memory(self, filename, mem):
+        self.name = filename
+        self.fd = io.BytesIO(mem)
+        self.size = len(mem)
 
     def close(self):
         self.fd.close()

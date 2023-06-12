@@ -73,7 +73,7 @@ def set_luajit_version(bc_version):
 
 
 class Main:
-    def __init__(self):
+    def __init__(self, args=None, is_lib=False):
         # Parser arguments
         parser = OptionParser()
 
@@ -155,7 +155,7 @@ class Main:
 
         group.add_option("--dump", action="store_true", dest="dump_ast", default=False, help="Dump AST")
 
-        (self.options, args) = parser.parse_args()
+        (self.options, args) = parser.parse_args(args)
 
         # Allow the input argument to be either a folder or a file.
         if len(args) == 1:
@@ -174,7 +174,7 @@ class Main:
         # Verify arguments
         if self.options.folder_name:
             pass
-        elif not self.options.file_name:
+        elif not self.options.file_name and not is_lib:
             parser.error("Options -f or -r are required.")
             sys.exit(1)
 
@@ -348,13 +348,41 @@ class Main:
             raise
         return 1
 
+    def process_memory(self, mem, full_path, output_path=None):
+        try:
+            ast = self.decompile(full_path, mem)
+
+            if not output_path and not self.options.output:
+                print("\n--; Decompile of {0}".format(full_path))
+                ljd.lua.writer.write(sys.stdout, ast)
+                self.lock.release()
+                return 0
+
+            if not output_path:
+                new_path = os.path.join(self.options.output, os.path.relpath(full_path, self.options.folder_name))
+                os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                if not full_path.endswith('.lua'):
+                    new_path = new_path[:-1]
+            else:
+                new_path = output_path
+            
+            self.write_file(ast, new_path)
+            if self.options.enable_logging:
+                print("Success")
+            return 0
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise
+        return 1
+    
     def write_file(self, ast, file_name, **kwargs):
         if self.options.enable_logging:
             self.logger.debug("Writing file {0}...".format(file_name))
         with open(file_name, "w", encoding="utf8") as out_file:
             return ljd.lua.writer.write(out_file, ast, **kwargs)
 
-    def decompile(self, file_in):
+    def decompile(self, file_in, mem=None):
         def on_parse_header(preheader):
             # Identify the version of LuaJIT used to compile the file
             bc_version = None
@@ -369,7 +397,7 @@ class Main:
 
             set_luajit_version(bc_version)
 
-        header, prototype = ljd.rawdump.parser.parse(file_in, on_parse_header)
+        header, prototype = ljd.rawdump.parser.parse(file_in, on_parse_header, mem)
 
         if not prototype:
             return 1

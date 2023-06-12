@@ -18,10 +18,13 @@ class _State:
         self.prototypes = []
 
 
-def parse(filename, on_parse_header=None):
+def parse(file_in, on_parse_header=None, mem=None):
     parser = _State()
 
-    parser.stream.open(filename)
+    if mem:
+        parser.stream.open_memory(file_in, mem)
+    else:
+        parser.stream.open(file_in)
 
     header = ljd.rawdump.header.Header()
 
